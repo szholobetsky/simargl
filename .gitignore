@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Build artifacts
+old/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# simargl index files (numpy backend)
+*.int8
+*.json.meta
+
+# simargl store directories
+store/
+index/
+
+# SQLite databases (datasets shipped separately via Zenodo)
+*.db
+
+# Sentence-transformers / HuggingFace model cache
+.cache/
+models/
+
+# Experiment outputs
+results/
+*.csv
+*.png
