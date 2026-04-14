@@ -11,8 +11,7 @@ Exposes an MCP server (stdio transport) compatible with any MCP-aware agent syst
 ## Install
 
 ```bash
-cd simargl
-pip install -e .
+pip install simargl
 ```
 
 The default embedding model (`bge-small`, ~130MB) is downloaded automatically during install.
@@ -557,4 +556,4 @@ For most projects (sonar.db = ~100k chunks) numpy is fast enough. Switch to post
 - Mode `aggregated` — avg task vectors → file search
 - Set operations: `/mcp simargl find "query" mode=tasks+files` (union/intersection)
 - Gradio web UI (`simargl ui`)
-- PostgreSQL backend (`pip install -e ".[postgres]"`)
+- PostgreSQL backend (`pip install "simargl[postgres]"`)
