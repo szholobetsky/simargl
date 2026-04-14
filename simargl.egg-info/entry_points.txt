@@ -1,3 +1,0 @@
-[console_scripts]
-simargl = simargl.ui.cli:main
-simargl-mcp = simargl.mcp_server:main
