@@ -168,14 +168,16 @@ def index_units(
     project_id: str = "default",
     store_dir: str = STORE_DIR,
     mode: str = "auto",
+    last: int | None = None,
     backend_type: str = "numpy",
     db_url: str | None = None,
 ) -> dict:
     """Index semantic units (tasks or commits) from SQLite.
 
-    mode="auto"    → detect by TASK_NAME coverage in COMMIT table
+    mode="auto"    → detect by TASK_NAME coverage in COMMITS table
     mode="tasks"   → TASKS.TITLE + TASKS.DESCRIPTION
-    mode="commits" → COMMIT.MESSAGE grouped by SHA
+    mode="commits" → COMMITS.MESSAGE grouped by SHA
+    last=N         → use only the N most recent tasks/commits (by commit date)
     """
     embedder = get_embedder(model_key)
     backend = make_backend(backend_type, store_dir=store_dir,
@@ -201,10 +203,28 @@ def index_units(
     texts: list[str] = []
     unit_file_rows: list[tuple] = []
 
+    # SQL fragment that selects the N most-recent task names / SHAs
+    _RECENT_TASKS_SQL = (
+        "SELECT TASK_NAME FROM COMMITS WHERE TASK_NAME IS NOT NULL "
+        "GROUP BY TASK_NAME ORDER BY MAX(CMT_DATE) DESC LIMIT ?"
+    )
+    _RECENT_SHA_SQL = (
+        "SELECT SHA FROM COMMITS WHERE SHA IS NOT NULL "
+        "GROUP BY SHA ORDER BY MAX(CMT_DATE) DESC LIMIT ?"
+    )
+
     if mode == "tasks":
-        tasks = conn.execute(
-            "SELECT NAME, TITLE, DESCRIPTION FROM TASKS"
-        ).fetchall()
+        if last:
+            tasks = conn.execute(
+                f"SELECT NAME, TITLE, DESCRIPTION FROM TASKS "
+                f"WHERE NAME IN ({_RECENT_TASKS_SQL})",
+                (last,),
+            ).fetchall()
+        else:
+            tasks = conn.execute(
+                "SELECT NAME, TITLE, DESCRIPTION FROM TASKS"
+            ).fetchall()
+
         for task in tqdm(tasks, desc="Reading tasks", unit="task"):
             name = task["NAME"]
             text = combine_fields(dict(task), ["TITLE", "DESCRIPTION"])
@@ -213,18 +233,35 @@ def index_units(
             previews.append(text[:120])
             texts.append(text)
 
-        rows = conn.execute(
-            "SELECT TASK_NAME, PATH, SHA FROM COMMITS WHERE TASK_NAME IS NOT NULL"
-        ).fetchall()
+        if last:
+            rows = conn.execute(
+                f"SELECT TASK_NAME, PATH, SHA FROM COMMITS "
+                f"WHERE TASK_NAME IS NOT NULL "
+                f"AND TASK_NAME IN ({_RECENT_TASKS_SQL})",
+                (last,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT TASK_NAME, PATH, SHA FROM COMMITS WHERE TASK_NAME IS NOT NULL"
+            ).fetchall()
         for r in rows:
             fp = norm_path(r["PATH"])
             unit_file_rows.append((r["TASK_NAME"], fp, module_from_path(fp),
                                    r["SHA"] or "", db_path))
 
     else:  # commits
-        rows = conn.execute(
-            "SELECT SHA, MESSAGE, PATH FROM COMMITS WHERE SHA IS NOT NULL GROUP BY SHA"
-        ).fetchall()
+        if last:
+            rows = conn.execute(
+                f"SELECT SHA, MESSAGE, PATH FROM COMMITS "
+                f"WHERE SHA IS NOT NULL AND SHA IN ({_RECENT_SHA_SQL}) "
+                f"GROUP BY SHA",
+                (last,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT SHA, MESSAGE, PATH FROM COMMITS WHERE SHA IS NOT NULL GROUP BY SHA"
+            ).fetchall()
+
         seen_sha: set[str] = set()
         for r in rows:
             sha = r["SHA"]
@@ -237,9 +274,16 @@ def index_units(
             previews.append(text[:120])
             texts.append(text)
 
-        all_rows = conn.execute(
-            "SELECT SHA, PATH FROM COMMITS WHERE SHA IS NOT NULL"
-        ).fetchall()
+        if last:
+            all_rows = conn.execute(
+                f"SELECT SHA, PATH FROM COMMITS "
+                f"WHERE SHA IS NOT NULL AND SHA IN ({_RECENT_SHA_SQL})",
+                (last,),
+            ).fetchall()
+        else:
+            all_rows = conn.execute(
+                "SELECT SHA, PATH FROM COMMITS WHERE SHA IS NOT NULL"
+            ).fetchall()
         for r in all_rows:
             fp = norm_path(r["PATH"])
             unit_file_rows.append((r["SHA"], fp, module_from_path(fp), r["SHA"], db_path))
@@ -255,6 +299,7 @@ def index_units(
         "model_key": model_key,
         "dim": embedder.dim,
         "unit_mode": mode,
+        "unit_last": last,
         "db_path": db_path,
         "indexed_at": datetime.datetime.utcnow().isoformat(),
     }
@@ -266,4 +311,4 @@ def index_units(
         pass
     backend.save_meta(meta)
 
-    return {"units_indexed": len(texts), "mode_used": mode}
+    return {"units_indexed": len(texts), "mode_used": mode, "last": last}

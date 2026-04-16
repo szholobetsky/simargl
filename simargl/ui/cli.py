@@ -8,7 +8,7 @@ Usage:
   simargl search "query" [--mode task|file|aggr] [--sort rank|freq] [--project P]
   simargl status [--project P]
   simargl vacuum [--project P]
-  simargl ui [--port 7860]
+  simargl ui [--port 7861]
   simargl serve [--http --port 8765]
 """
 from __future__ import annotations
@@ -99,6 +99,8 @@ def main():
     idx_units.add_argument("--project", default="default")
     idx_units.add_argument("--model", default=None)
     idx_units.add_argument("--mode", default="auto", choices=["auto", "tasks", "commits"])
+    idx_units.add_argument("--last", type=int, default=None, metavar="N",
+                           help="Index only the N most recent tasks/commits (by commit date)")
     _add_backend_args(idx_units)
 
     # download
@@ -128,9 +130,12 @@ def main():
 
     # ui (Gradio)
     ui_p = sub.add_parser("ui", help="Start Gradio web UI")
-    ui_p.add_argument("--port", type=int, default=7860)
+    ui_p.add_argument("--port", type=int, default=7861)
     ui_p.add_argument("--host", default="0.0.0.0")
     ui_p.add_argument("--store-dir", default=".simargl")
+
+    # about
+    sub.add_parser("about", help="Show version and authorship")
 
     # serve (MCP)
     srv = sub.add_parser("serve", help="Start MCP server")
@@ -346,10 +351,12 @@ def main():
             project_id=args.project,
             store_dir=args.store_dir,
             mode=args.mode,
+            last=args.last,
             backend_type=args.backend,
             db_url=args.db_url,
         )
-        print(f"Done. Units: {result['units_indexed']}  Mode: {result['mode_used']}")
+        last_str = f"  Last: {result['last']}" if result['last'] else ""
+        print(f"Done. Units: {result['units_indexed']}  Mode: {result['mode_used']}{last_str}")
 
     elif args.cmd == "search":
         from ..searcher import search
@@ -396,7 +403,9 @@ def main():
             print(f"Model:         {s.get('model_key', '?')}  dim={s.get('dim', '?')}")
             print(f"Files:         {s.get('files', 0)}  ({s.get('chunks', 0)} chunks"
                   + (f", {s.get('deleted_chunks', 0)} deleted" if s.get('deleted_chunks') else "") + ")")
-            print(f"Units:         {s.get('units', 0)}  (mode={s.get('unit_mode', '?')})")
+            unit_last = s.get('unit_last')
+            last_str = f"  last={unit_last}" if unit_last else ""
+            print(f"Units:         {s.get('units', 0)}  (mode={s.get('unit_mode', '?')}{last_str})")
             print(f"Indexed:       {s.get('indexed_at', '?')}")
         except FileNotFoundError as e:
             print(str(e))
@@ -432,6 +441,13 @@ def main():
             _sys.argv += ["--db-url", args.db_url]
         from ..mcp_server import main as mcp_main
         mcp_main()
+
+    elif args.cmd == "about":
+        print("simargl — Semantic Index: Map Artifacts, Retrieve from Git Log")
+        print()
+        print("(c) 2026 Stanislav Zholobetskyi")
+        print("Institute for Information Recording, National Academy of Sciences of Ukraine, Kyiv")
+        print("PhD research: \u00abIntelligent Technology for Software Development and Maintenance Support\u00bb")
 
     else:
         parser.print_help()

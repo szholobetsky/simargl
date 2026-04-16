@@ -29,16 +29,41 @@ You need two indexes: one for code files, one for tasks (or commits if no tracke
 
 ```bash
 # Index code files (walks the repo, chunks text files, stores vectors)
-simargl index files C:/repos/sonar --project sonar
+simargl index files C:/repos/sonar
 
 # Index tasks from SQLite (auto-detects tasks vs commits)
-simargl index units C:/data/sonar.db --project sonar
+simargl index units C:/data/sonar.db
 
 # Check what was indexed
-simargl status --project sonar
+simargl status
 ```
 
-Both indexes land in `.simargl/sonar/` relative to your working directory.
+Both indexes land in `.simargl/default/` relative to your working directory.
+
+If you want to index only part of the repo, or keep two sub-projects separate, use `--project`:
+
+```bash
+simargl index files C:/repos/sonar/server --project server
+simargl index units C:/data/sonar.db --project server
+simargl status --project server
+```
+
+Each project stores its vectors in `.simargl/{project}/` independently.
+
+**`--last N` — index only recent history**
+
+For large repositories where development is continuous, the most recent tasks or commits describe the current codebase better than the full history. Use `--last` to limit the units index to the N most recent tasks (or commits), ordered by commit date:
+
+```bash
+simargl index units C:/data/sonar.db --last 1000
+simargl index units C:/data/kafka.db --last 500 --mode commits
+```
+
+This is especially useful for `aggr` search mode, which averages unit vectors per file — recent units produce a more focused signal than a full multi-year history.
+
+According to our research, `--last 1000` produces better retrieval quality than either `--last 100` (too narrow) or `--last 10000` (too much noise from distant history). 1000 recent tasks is a good default for actively developed projects.
+
+*(experiment data and article links will be added here after publication)*
 
 Use `--model bge-large` if you need higher accuracy (uses more RAM and disk).
 
@@ -279,13 +304,44 @@ Each project stores its vectors in `.simargl/{project_id}/` independently.
 
 ---
 
-## Running on Android (Termux) — LAN access from laptop
+## Running on a dedicated machine or phone — LAN access
 
-simargl runs fully on Android via Termux. With 8GB+ RAM (e.g. Redmi Note 14 Pro 12/512)
-Ollama + nomic-embed-text + simargl-mcp all fit comfortably on the phone.
-The laptop connects over LAN — no cloud, no GPU, everything local.
+simargl can run on any machine on your LAN: a dedicated server, a Raspberry Pi, or an Android phone via Termux. The index, embedding model, MCP server, and web UI all run there — the laptop just opens a browser or connects an agent.
 
-### Phone setup (Termux)
+### Web UI over LAN
+
+The web UI binds to `0.0.0.0` by default, so it is immediately visible on the local network:
+
+```bash
+# on the server / phone
+simargl ui --port 7860
+
+# on any browser in the same LAN
+http://192.168.1.42:7860
+```
+
+Install the UI extra if not already present:
+```bash
+pip install "simargl[ui]"
+```
+
+Keep it running in the background with tmux or nohup (see below). The UI lets you search all indexed projects, switch mode/sort, and browse results — no agent or CLI needed on the client side.
+
+The UI includes a **Download index** section (collapsed accordion at the bottom). Select a project and click **Prepare ZIP** to download the full index (all six files: `files.int8`, `files.db`, `units.int8`, `units.db`, `unit_files.db`, `meta.json`) as a single ZIP. Extract it as `.simargl/` on your local machine and run `simargl search` or `simargl status` without re-indexing.
+
+```bash
+unzip default.zip -d .simargl/
+simargl status
+simargl search "add author field to Book class"
+```
+
+---
+
+### Android (Termux) — full setup
+
+With 8GB+ RAM Ollama + nomic-embed-text + simargl all fit comfortably on the phone. The laptop connects over LAN — no cloud, no GPU, everything local.
+
+#### Phone setup (Termux)
 
 ```bash
 # base tools
@@ -315,7 +371,7 @@ simargl-mcp --http --port 8765
 # → simargl MCP server — http://0.0.0.0:8765/sse
 ```
 
-### Laptop — connect to phone
+#### Laptop — connect to phone
 
 Find phone IP: `ip addr` in Termux or check Wi-Fi settings.
 
@@ -338,7 +394,7 @@ Find phone IP: `ip addr` in Termux or check Wi-Fi settings.
 
 **Claude Code / OpenCode / Cursor** — same URL pattern, see agent-specific config above.
 
-### Keep server running in Termux background
+#### Keep server running in Termux background
 
 ```bash
 # run in background, log to file
@@ -350,13 +406,14 @@ simargl-mcp --http --port 8765
 # Ctrl+B D  to detach
 ```
 
-### What runs where
+#### What runs where
 
-| Component | Phone | Laptop |
+| Component | Server / phone | Laptop / client |
 |---|---|---|
 | Vector index (.simargl/) | yes | — |
-| Embedding model (nomic-embed-text) | yes (Ollama) | — |
+| Embedding model | yes (Ollama) | — |
 | MCP server (simargl-mcp) | yes | — |
+| Web UI (simargl ui) | yes | browser only |
 | Agent / LLM (1bcoder, Claude) | — | yes |
 | Repo source files | yes (for indexing) | yes (for editing) |
 
@@ -547,6 +604,14 @@ simargl-mcp --backend postgres \
 | Laptop / server | yes | yes |
 
 For most projects (sonar.db = ~100k chunks) numpy is fast enough. Switch to postgres when search latency becomes noticeable or you index multiple large repos.
+
+---
+
+## About
+
+(c) 2026 Stanislav Zholobetskyi  
+Institute for Information Recording, National Academy of Sciences of Ukraine, Kyiv  
+PhD research: «Intelligent Technology for Software Development and Maintenance Support»
 
 ---
 

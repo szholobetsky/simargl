@@ -1,7 +1,7 @@
 """Gradio web UI for simargl.
 
 Start:
-  simargl ui                  # default port 7860
+  simargl ui                  # default port 7861
   simargl ui --port 7861
 
 Layout:
@@ -34,6 +34,38 @@ def _list_projects(store_dir: str = STORE_DIR) -> list[str]:
         return ["default"]
     projects = [d.name for d in p.iterdir() if d.is_dir() and (d / "meta.json").exists()]
     return projects or ["default"]
+
+
+def _zip_project(store_dir: str, project_id: str) -> str:
+    """Zip .simargl/{project_id}/ into a temp file and return its path.
+
+    meta.json is patched before zipping: db_path is reduced to basename only
+    so it does not contain a server-side absolute path.
+    """
+    import zipfile, tempfile, json as _json
+    project_dir = Path(store_dir) / project_id
+    if not project_dir.exists():
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='_error.txt',
+                                          delete=False, encoding='utf-8')
+        tmp.write(f"Project not found: {project_dir}\nRun: simargl index files/units first.")
+        tmp.close()
+        return tmp.name
+
+    tmp = tempfile.NamedTemporaryFile(suffix=f'_{project_id}.zip', delete=False)
+    tmp.close()
+    with zipfile.ZipFile(tmp.name, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for f in sorted(project_dir.iterdir()):
+            if not f.is_file():
+                continue
+            if f.name == 'meta.json':
+                meta = _json.loads(f.read_text(encoding='utf-8'))
+                if 'db_path' in meta:
+                    meta['db_path'] = Path(meta['db_path']).name  # basename only
+                zf.writestr(str(Path(project_id) / f.name),
+                            _json.dumps(meta, indent=2))
+            else:
+                zf.write(f, arcname=str(Path(project_id) / f.name))
+    return tmp.name
 
 
 def _format_files(files: list[dict]) -> str:
@@ -75,7 +107,11 @@ def _format_units(units: list[dict]) -> str:
 def _run_search(query, mode, sort, project_id, top_n, top_k, top_m,
                 include_diff, store_dir):
     if not query.strip():
-        return "_Enter a query._", "", ""
+        yield "_Enter a query._", "", ""
+        return
+
+    yield "_Searching..._", "_Searching..._", "_Searching..._"
+
     try:
         result = search(
             query, mode=mode, sort=sort,
@@ -84,12 +120,13 @@ def _run_search(query, mode, sort, project_id, top_n, top_k, top_m,
             project_id=project_id, store_dir=store_dir,
         )
     except Exception as e:
-        return f"**Error:** {e}", "", ""
+        yield f"**Error:** {e}", "", ""
+        return
 
     files_md   = _format_files(result["files"])
     modules_md = _format_modules(result["modules"])
     units_md   = _format_units(result["units"])
-    return files_md, modules_md, units_md
+    yield files_md, modules_md, units_md
 
 
 def build_app(store_dir: str = STORE_DIR):
@@ -100,10 +137,13 @@ def build_app(store_dir: str = STORE_DIR):
             "Gradio not installed. Run: pip install simargl[ui]"
         )
 
+    project_root = Path(store_dir).resolve().parent
+    project_name = project_root.name
+
     projects = _list_projects(store_dir)
 
-    with gr.Blocks(title="simargl — task-to-code retrieval", theme=gr.themes.Monochrome()) as app:
-        gr.Markdown("## simargl — task-to-code retrieval")
+    with gr.Blocks(title=f"simargl — {project_name}", theme=gr.themes.Monochrome()) as app:
+        gr.Markdown(f"## simargl — task-to-code retrieval :: {project_name}")
 
         with gr.Row():
             query_box = gr.Textbox(
@@ -162,13 +202,42 @@ def build_app(store_dir: str = STORE_DIR):
                   top_n_sl, top_k_sl, top_m_sl, include_diff_cb, store_dir_box]
         outputs = [files_out, modules_out, units_out]
 
-        search_btn.click(_run_search, inputs=inputs, outputs=outputs)
-        query_box.submit(_run_search, inputs=inputs, outputs=outputs)
+        search_btn.click(_run_search, inputs=inputs, outputs=outputs,
+                          show_progress="full")
+        query_box.submit(_run_search, inputs=inputs, outputs=outputs,
+                         show_progress="full")
+
+        # ── Download ──────────────────────────────────────────────────────
+        with gr.Accordion("Download index", open=False):
+            gr.Markdown(
+                "Download the full index for a project as a ZIP file.\n\n"
+                "Extract on your local machine as `.simargl/` and run `simargl search` or "
+                "`simargl status` locally. All six index files are included.\n\n"
+                "`db_path` in `meta.json` is automatically reduced to a bare filename "
+                "so it contains no server-side absolute paths."
+            )
+            with gr.Row():
+                dl_project_dd = gr.Dropdown(
+                    choices=projects, value=projects[0], label="Project to download"
+                )
+                dl_btn = gr.Button("Prepare ZIP", variant="primary")
+            dl_file = gr.File(label="Download", interactive=False)
+
+            def _prepare_zip(sd, pid):
+                return _zip_project(sd, pid)
+
+            dl_btn.click(_prepare_zip,
+                         inputs=[store_dir_box, dl_project_dd],
+                         outputs=dl_file)
+
+            # keep download project list in sync with store_dir changes
+            store_dir_box.change(refresh_projects, inputs=store_dir_box,
+                                 outputs=dl_project_dd)
 
     return app
 
 
-def main(port: int = 7860, host: str = "0.0.0.0", store_dir: str = STORE_DIR):
+def main(port: int = 7861, host: str = "0.0.0.0", store_dir: str = STORE_DIR):
     app = build_app(store_dir=store_dir)
     print(f"simargl UI — open: http://localhost:{port}")
     app.launch(server_name=host, server_port=port)
