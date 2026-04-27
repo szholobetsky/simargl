@@ -1,3 +1,5 @@
+![simargl](images/simargl.png)
+
 # simargl
 
 **S**emantic **I**ndex: **M**ap **A**rtifacts, **R**etrieve from **G**it **L**og
@@ -613,12 +615,3 @@ For most projects (sonar.db = ~100k chunks) numpy is fast enough. Switch to post
 Institute for Information Recording, National Academy of Sciences of Ukraine, Kyiv  
 PhD research: «Intelligent Technology for Software Development and Maintenance Support»
 
----
-
-## Deferred (session 2)
-
-- Ollama and OpenAI embedding providers (`ollama://nomic-embed`, `openai://text-embedding-3-small`)
-- Mode `aggregated` — avg task vectors → file search
-- Set operations: `/mcp simargl find "query" mode=tasks+files` (union/intersection)
-- Gradio web UI (`simargl ui`)
-- PostgreSQL backend (`pip install "simargl[postgres]"`)
