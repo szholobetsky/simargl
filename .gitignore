@@ -40,14 +40,6 @@ Thumbs.db
 store/
 index/
 
-# SQLite databases (datasets shipped separately via Zenodo)
-*.db
-
 # Sentence-transformers / HuggingFace model cache
 .cache/
 models/
-
-# Experiment outputs
-results/
-*.csv
-*.png
