@@ -609,6 +609,28 @@ For most projects (sonar.db = ~100k chunks) numpy is fast enough. Switch to post
 
 ---
 
+## Part of the SIMARGL toolkit
+
+simargl is one of four tools that together form an **intellectual development support system**:
+
+| Tool | Role |
+|---|---|
+| **[simargl](https://github.com/szholobetsky/simargl)** | Task-to-code retrieval — given a task description, finds which files and modules are likely affected, using semantic similarity over git history |
+| **[svitovyd](https://github.com/szholobetsky/svitovyd)** | Project map — scans any codebase and produces a structural map of definitions and cross-file dependencies; exposes it as an MCP server |
+| **[1bcoder](https://github.com/szholobetsky/1bcoder)** | AI coding assistant for small local models — surgical context management, agents, parallel inference, proc scripts |
+| **[yasna](https://github.com/szholobetsky/yasna)** | Session memory — indexes conversations from all AI agents so you can find what was discussed, when, and where |
+
+- **simargl** answers: *what code is related to this task?*
+- **svitovyd** answers: *how is the code structured and what depends on what?*
+- **1bcoder** answers: *how do I work with local models efficiently?*
+- **yasna** answers: *where did I already discuss this?*
+
+Together they cover the full development loop: understand the codebase, find relevant history, work with AI locally, remember what was decided.
+
+The name comes from Slavic mythology. Simargl (Симаргл) is a winged guardian spirit — a fiery dog with wings, protector of seeds and the earth, messenger between the heavens and the world of men. A fitting name for a tool that retrieves the seeds of code most relevant to any task.
+
+---
+
 ## About
 
 (c) 2026 Stanislav Zholobetskyi  
