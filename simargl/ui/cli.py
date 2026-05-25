@@ -109,13 +109,16 @@ def main():
 
     # search
     srch = sub.add_parser("search", help="Search the index from terminal")
-    srch.add_argument("query")
+    srch.add_argument("query", help="Query text, or '-' to read from stdin")
     srch.add_argument("--mode", default="task", choices=["task", "file", "aggr"])
     srch.add_argument("--sort", default="rank", choices=["rank", "freq"])
     srch.add_argument("--project", default="default")
     srch.add_argument("--top-n", type=int, default=10)
     srch.add_argument("--top-k", type=int, default=10)
     srch.add_argument("--diff", action="store_true", help="Include diffs in output")
+    srch.add_argument("--format", default="text",
+                      choices=["text", "json", "paths", "modules"],
+                      help="Output format: text (default), json, paths (files only), modules (modules only)")
     _add_backend_args(srch)
 
     # status
@@ -359,10 +362,17 @@ def main():
         print(f"Done. Units: {result['units_indexed']}  Mode: {result['mode_used']}{last_str}")
 
     elif args.cmd == "search":
+        import json as _json
         from ..searcher import search
+
+        query = sys.stdin.read().strip() if args.query == "-" else args.query
+        if not query:
+            print("Error: empty query", file=sys.stderr)
+            sys.exit(1)
+
         try:
             result = search(
-                args.query,
+                query,
                 mode=args.mode, sort=args.sort,
                 top_n=args.top_n, top_k=args.top_k,
                 include_diff=args.diff,
@@ -375,20 +385,34 @@ def main():
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
 
-        print(f"Query: {args.query}  mode={args.mode}" +
-              (f"  sort={args.sort}" if args.mode == "task" else ""))
-        print()
-        print("Files:")
-        for f in result["files"]:
-            print(f"  {f['score']:.3f}  {f['path']}  [{f['module']}]")
-        if result["modules"]:
-            print("\nModules:")
+        fmt = args.format
+
+        if fmt == "json":
+            print(_json.dumps(result, ensure_ascii=False, indent=2))
+
+        elif fmt == "paths":
+            for f in result["files"]:
+                print(f["path"])
+
+        elif fmt == "modules":
             for m in result["modules"]:
-                print(f"  {m['score']:.3f}  {m['module']}")
-        if result["units"]:
-            print("\nSimilar units:")
-            for u in result["units"][:5]:
-                print(f"  [{u['similarity']:.3f}] {u['unit_id']} — {u['text_preview'][:80]}")
+                print(m["module"])
+
+        else:  # text
+            print(f"Query: {query}  mode={args.mode}" +
+                  (f"  sort={args.sort}" if args.mode == "task" else ""), file=sys.stderr)
+            print(file=sys.stderr)
+            print("Files:")
+            for f in result["files"]:
+                print(f"  {f['score']:.3f}  {f['path']}  [{f['module']}]")
+            if result["modules"]:
+                print("\nModules:")
+                for m in result["modules"]:
+                    print(f"  {m['score']:.3f}  {m['module']}")
+            if result["units"]:
+                print("\nSimilar units:")
+                for u in result["units"][:5]:
+                    print(f"  [{u['similarity']:.3f}] {u['unit_id']} — {u['text_preview'][:80]}")
                 if u.get("diff"):
                     print(f"    ---\n{u['diff'][:400]}")
 
