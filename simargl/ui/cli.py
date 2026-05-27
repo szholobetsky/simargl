@@ -110,16 +110,79 @@ def main():
     # search
     srch = sub.add_parser("search", help="Search the index from terminal")
     srch.add_argument("query", help="Query text, or '-' to read from stdin")
-    srch.add_argument("--mode", default="task", choices=["task", "file", "aggr"])
+    srch.add_argument("--mode", default="task", choices=["task", "file", "aggr", "refine"])
     srch.add_argument("--sort", default="rank", choices=["rank", "freq"])
     srch.add_argument("--project", default="default")
     srch.add_argument("--top-n", type=int, default=10)
     srch.add_argument("--top-k", type=int, default=10)
     srch.add_argument("--diff", action="store_true", help="Include diffs in output")
+    srch.add_argument("--no-blackholes", action="store_true",
+                      help="Exclude blackhole files from results")
+    srch.add_argument("--coverage-penalty", type=float, default=0.0, metavar="λ",
+                      help="Re-ranking penalty for omnipresent files (e.g. 0.2). "
+                           "Run 'simargl blackhole --method coverage_float' first.")
+    srch.add_argument("--score-blend", type=float, default=1.0, metavar="α",
+                      help="Topic concentration blend: α*max+(1-α)*mean per file. "
+                           "1.0=off (default), 0.5-0.7 pushes down broad documents.")
+    srch.add_argument("--refine-top-k", type=int, default=10,
+                      help="refine mode: commits used for query expansion (default: 10)")
+    srch.add_argument("--refine-top-m", type=int, default=8,
+                      help="refine mode: new terms added to query (default: 8)")
     srch.add_argument("--format", default="text",
                       choices=["text", "json", "paths", "modules"],
                       help="Output format: text (default), json, paths (files only), modules (modules only)")
     _add_backend_args(srch)
+
+    # rrf
+    rrf_p = sub.add_parser("rrf", help="Merge search results from multiple modes/projects (RRF)")
+    rrf_p.add_argument("query", help="Query text, or '-' to read from stdin")
+    rrf_p.add_argument("--sources", default="task:default,file:default",
+                       metavar="SOURCES",
+                       help="Comma-separated mode:project_id pairs  "
+                            "(e.g. task:default,file:jina)")
+    rrf_p.add_argument("--top-n", type=int, default=5)
+    rrf_p.add_argument("--top-k", type=int, default=10,
+                       help="Candidates per source before merge (default: 10)")
+    rrf_p.add_argument("--k", type=int, default=60,
+                       help="RRF damping constant (default: 60)")
+    rrf_p.add_argument("--sort", default="freq", choices=["rank", "freq"],
+                       help="Sort for task sources (default: freq)")
+    rrf_p.add_argument("--score-blend", type=float, default=1.0, metavar="α")
+    rrf_p.add_argument("--format", default="text", choices=["text", "json", "paths"])
+    _add_backend_args(rrf_p)
+
+    # blackhole
+    bh = sub.add_parser("blackhole", help="Detect and mark blackhole files (semantic noise)")
+    bh.add_argument("--method", default="centroid",
+                    choices=["centroid", "coverage", "coverage_float"],
+                    help="centroid: fast binary; coverage: binary by query fraction; "
+                         "coverage_float: store float scores for re-ranking (recommended)")
+    bh.add_argument("--threshold", type=float, default=None,
+                    help="Threshold (centroid: 0.85; coverage: 0.3 — fraction of queries)")
+    bh.add_argument("--n-queries", type=int, default=100,
+                    help="Number of specific test queries for coverage method (default: 100)")
+    bh.add_argument("--top-k", type=int, default=20,
+                    help="Top-k file results per query for coverage method (default: 20)")
+    bh.add_argument("--project", default="default")
+    bh.add_argument("--list", action="store_true", help="List marked blackhole paths")
+    _add_backend_args(bh)
+
+    # retrieve
+    ret = sub.add_parser("retrieve", help="Retrieve text chunks ready for LLM context injection")
+    ret.add_argument("query")
+    ret.add_argument("--mode", default="file", choices=["file", "task", "aggr"])
+    ret.add_argument("--top-n", type=int, default=5)
+    ret.add_argument("--diff", action="store_true", help="Include diffs (task mode)")
+    ret.add_argument("--no-blackholes", action="store_true",
+                     help="Exclude blackhole files from results")
+    ret.add_argument("--coverage-penalty", type=float, default=0.0, metavar="λ",
+                     help="Re-ranking penalty for omnipresent files (e.g. 0.2)")
+    ret.add_argument("--score-blend", type=float, default=1.0, metavar="α",
+                     help="Topic concentration blend: α*max+(1-α)*mean (e.g. 0.7)")
+    ret.add_argument("--files", default=None,
+                     help="Comma-separated file paths to fetch content (aggr step 2)")
+    ret.add_argument("--project", default="default")
+    _add_backend_args(ret)
 
     # status
     stat = sub.add_parser("status")
@@ -376,6 +439,11 @@ def main():
                 mode=args.mode, sort=args.sort,
                 top_n=args.top_n, top_k=args.top_k,
                 include_diff=args.diff,
+                exclude_blackholes=args.no_blackholes,
+                coverage_penalty=args.coverage_penalty,
+                score_blend=args.score_blend,
+                refine_top_k=args.refine_top_k,
+                refine_top_m=args.refine_top_m,
                 project_id=args.project,
                 store_dir=args.store_dir,
                 backend_type=args.backend,
@@ -401,6 +469,8 @@ def main():
         else:  # text
             print(f"Query: {query}  mode={args.mode}" +
                   (f"  sort={args.sort}" if args.mode == "task" else ""), file=sys.stderr)
+            if result.get("refined"):
+                print(f"Expanded: {result['expanded_query']}", file=sys.stderr)
             print(file=sys.stderr)
             print("Files:")
             for f in result["files"]:
@@ -415,6 +485,132 @@ def main():
                     print(f"  [{u['similarity']:.3f}] {u['unit_id']} — {u['text_preview'][:80]}")
                 if u.get("diff"):
                     print(f"    ---\n{u['diff'][:400]}")
+
+    elif args.cmd == "rrf":
+        import json as _json
+        from ..searcher import rrf_search
+
+        query = sys.stdin.read().strip() if args.query == "-" else args.query
+        if not query:
+            print("Error: empty query", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            result = rrf_search(
+                query,
+                sources=args.sources,
+                top_n=args.top_n,
+                k=args.k,
+                top_k=args.top_k,
+                sort=args.sort,
+                score_blend=args.score_blend,
+                store_dir=args.store_dir,
+                backend_type=args.backend,
+                db_url=args.db_url,
+            )
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        if args.format == "json":
+            print(_json.dumps(result, ensure_ascii=False, indent=2))
+        elif args.format == "paths":
+            for f in result["files"]:
+                print(f["path"])
+        else:
+            print(f"Query:   {query}", file=sys.stderr)
+            print(f"Sources: {args.sources}  k={args.k}", file=sys.stderr)
+            print(file=sys.stderr)
+            for sr in result["sources"]:
+                err = sr.get("error", "")
+                status = f"ERROR: {err}" if err else f"{len(sr['files'])} candidates"
+                print(f"  [{sr['mode']}:{sr['project_id']}]  {status}", file=sys.stderr)
+            print(file=sys.stderr)
+            print(f"RRF top-{args.top_n}:")
+            for f in result["files"]:
+                print(f"  {f['score']:.6f}  {f['path']}  [{f['module']}]")
+            if result["modules"]:
+                print("\nModules:")
+                for m in result["modules"]:
+                    print(f"  {m['module']}")
+
+    elif args.cmd == "blackhole":
+        from ..backends import make_backend
+        try:
+            backend = make_backend(args.backend, store_dir=args.store_dir,
+                                   project_id=args.project, db_url=args.db_url)
+            if args.list:
+                paths = sorted(backend.blackhole_paths())
+                if paths:
+                    print(f"Blackhole files ({len(paths)}):")
+                    for p in paths:
+                        print(f"  {p}")
+                else:
+                    print("No blackhole files marked. Run: simargl blackhole")
+            else:
+                meta = backend.load_meta()
+                if args.method == "coverage_float":
+                    result = backend.compute_file_coverage(
+                        meta["dim"], n_queries=args.n_queries, top_k=args.top_k,
+                    )
+                    print(f"Coverage scores computed — project={args.project}")
+                    print(f"  Method      : coverage_float (re-ranking, no binary filter)")
+                    print(f"  Test queries: {result['n_queries']}")
+                    print(f"  Top-k       : {result['top_k']}")
+                    print(f"  Total paths : {result['total_paths']}")
+                    print(f"  Max coverage: {result['max_coverage']:.4f}")
+                    print(f"\nUse --coverage-penalty 0.2 in search/retrieve to re-rank.")
+                elif args.method == "coverage":
+                    threshold = args.threshold if args.threshold is not None else 0.3
+                    result = backend.compute_blackholes_coverage(
+                        meta["dim"], n_queries=args.n_queries,
+                        threshold=threshold, top_k=args.top_k,
+                    )
+                    n_q = result["n_queries"]
+                    print(f"Blackhole detection complete (coverage) — project={args.project}")
+                    print(f"  Method     : coverage")
+                    print(f"  Threshold  : {threshold} ({int(threshold * n_q)} / {n_q} queries)")
+                    print(f"  Top-k      : {result['top_k']}")
+                    print(f"  Total paths: {result['total_paths']}")
+                    print(f"  Marked     : {result['marked']}")
+                    print(f"\nRun with --list to see marked files.")
+                    print(f"Use --no-blackholes in search/retrieve to exclude them.")
+                else:
+                    threshold = args.threshold if args.threshold is not None else 0.85
+                    result = backend.compute_blackholes(meta["dim"], threshold=threshold)
+                    print(f"Blackhole detection complete (centroid) — project={args.project}")
+                    print(f"  Method     : centroid")
+                    print(f"  Threshold  : {result['threshold']}")
+                    print(f"  Total paths: {result['total_paths']}")
+                    print(f"  Marked     : {result['marked']}")
+                    print(f"\nRun with --list to see marked files.")
+                    print(f"Use --no-blackholes in search/retrieve to exclude them.")
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.cmd == "retrieve":
+        from ..searcher import retrieve
+        files_list = [f.strip() for f in args.files.split(",")] if args.files else None
+        try:
+            text = retrieve(
+                args.query,
+                mode=args.mode,
+                top_n=args.top_n,
+                include_diff=args.diff,
+                exclude_blackholes=args.no_blackholes,
+                coverage_penalty=args.coverage_penalty,
+                score_blend=args.score_blend,
+                files_to_fetch=files_list,
+                project_id=args.project,
+                store_dir=args.store_dir,
+                backend_type=args.backend,
+                db_url=args.db_url,
+            )
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(text)
 
     elif args.cmd == "status":
         from ..backends import make_backend

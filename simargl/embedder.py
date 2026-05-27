@@ -28,6 +28,7 @@ from .config import MODELS, DEFAULT_MODEL
 
 class BaseEmbedder(ABC):
     dim: int
+    index_flush_size: int = 256  # how many texts to accumulate before flushing in indexer
 
     @abstractmethod
     def encode(self, texts: list[str], batch_size: int = 32) -> np.ndarray:
@@ -42,19 +43,28 @@ class BaseEmbedder(ABC):
 
 
 class SentenceTransformerEmbedder(BaseEmbedder):
-    def __init__(self, model_name: str, dim: int):
+    def __init__(self, model_name: str, dim: int,
+                 trust_remote_code: bool = False,
+                 batch_size: int = 32,
+                 max_seq_length: int | None = None):
         from sentence_transformers import SentenceTransformer
         self.dim = dim
+        self._batch_size = batch_size
         print(f"[simargl] Loading model {model_name} ...", file=sys.stderr, flush=True)
-        self._model = SentenceTransformer(model_name)
-        print(f"[simargl] Model ready.", file=sys.stderr, flush=True)
+        self._model = SentenceTransformer(model_name, trust_remote_code=trust_remote_code)
+        if max_seq_length is not None:
+            self._model.max_seq_length = max_seq_length
+        print(f"[simargl] Model ready (batch_size={batch_size}"
+              + (f", max_seq_length={max_seq_length}" if max_seq_length else "")
+              + ").", file=sys.stderr, flush=True)
 
-    def encode(self, texts: list[str], batch_size: int = 32) -> np.ndarray:
+    def encode(self, texts: list[str], batch_size: int | None = None) -> np.ndarray:
+        bs = batch_size if batch_size is not None else self._batch_size
         # show_progress_bar only when stderr is a tty — never when running under MCP stdio
         show_bar = len(texts) > 1 and sys.stderr.isatty()
         vecs = self._model.encode(
             texts,
-            batch_size=batch_size,
+            batch_size=bs,
             normalize_embeddings=True,
             show_progress_bar=show_bar,
         )
@@ -62,7 +72,7 @@ class SentenceTransformerEmbedder(BaseEmbedder):
 
 
 class OllamaEmbedder(BaseEmbedder):
-    """Calls POST {host}/api/embeddings — works with any Ollama instance.
+    """Calls POST {host}/api/embed — Ollama new batch API (v0.1.26+).
 
     model_key formats:
       ollama://nomic-embed-text                  → localhost:11434
@@ -70,34 +80,36 @@ class OllamaEmbedder(BaseEmbedder):
       ollama://nomic-embed-text@192.168.1.10:9999
     """
 
+    index_flush_size = 1  # embed each chunk immediately — no accumulation
+
     def __init__(self, model_name: str, host: str = "http://localhost:11434"):
         self._model = model_name
         self._host = host.rstrip("/")
-        self._url = f"{self._host}/api/embeddings"
-        # probe dim with a short text
+        self._url = f"{self._host}/api/embed"
         self.dim = self._probe_dim()
 
     def _probe_dim(self) -> int:
-        vec = self._embed_one("hello")
-        return len(vec)
+        return len(self._embed_batch(["hello"])[0])
 
-    def _embed_one(self, text: str) -> list[float]:
-        payload = json.dumps({"model": self._model, "prompt": text}).encode()
+    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        payload = json.dumps({"model": self._model, "input": texts}).encode()
         req = urllib.request.Request(
             self._url,
             data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read())
-        return data["embedding"]
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"Ollama error {e.code}: {e.read().decode()}") from e
+        return data["embeddings"]
 
-    def encode(self, texts: list[str], batch_size: int = 32) -> np.ndarray:
-        # Ollama /api/embeddings is one-at-a-time; batch by sequential calls
+    def encode(self, texts: list[str], batch_size: int = 1) -> np.ndarray:
         vecs = []
-        for text in texts:
-            vecs.append(self._embed_one(text))
+        for i in range(0, len(texts), batch_size):
+            vecs.extend(self._embed_batch(texts[i : i + batch_size]))
         arr = np.array(vecs, dtype=np.float32)
         return self._normalize(arr)
 
@@ -205,5 +217,10 @@ def get_embedder(model_key: str = DEFAULT_MODEL) -> BaseEmbedder:
 
     if model_key not in _cache:
         cfg = MODELS[model_key]
-        _cache[model_key] = SentenceTransformerEmbedder(cfg["name"], cfg["dim"])
+        _cache[model_key] = SentenceTransformerEmbedder(
+            cfg["name"], cfg["dim"],
+            trust_remote_code=cfg.get("trust_remote_code", False),
+            batch_size=cfg.get("batch_size", 32),
+            max_seq_length=cfg.get("max_seq_length"),
+        )
     return _cache[model_key]

@@ -1,37 +1,109 @@
-"""Searcher: search() with mode=task/file/aggr, sort=rank/freq.
+"""Searcher: search() with mode=task/file/aggr/refine, sort=rank/freq.
 
 Mode aliases (both accepted):
-  file  | files       — direct cosine search in file chunks
-  task  | tasks       — similar units → file mapping (rank or freq sort)
-  aggr  | aggregated  — average top-k unit vectors → cosine search in file chunks
+  file   | files       — direct cosine search in file chunks
+  task   | tasks       — similar units → file mapping (rank or freq sort)
+  aggr   | aggregated  — average top-k unit vectors → cosine search in file chunks
+  refine              — pseudo-relevance feedback: expand query with terms from
+                        top-k similar commits/tasks, then run file search
 """
 from __future__ import annotations
 
+import re
+import sqlite3
 from collections import Counter, defaultdict
+from pathlib import Path
 
 import numpy as np
 
 from .config import DEFAULT_MODEL, DEFAULT_TOP_K, DEFAULT_TOP_N, DEFAULT_TOP_M, STORE_DIR
 from .embedder import get_embedder
 from .backends import make_backend
-from .utils import module_from_path
+from .utils import module_from_path, chunk_text
 
 # accept short and long names
 _MODE_ALIASES = {
     "file": "file", "files": "file",
     "task": "task", "tasks": "task",
     "aggr": "aggr", "aggregated": "aggr",
+    "refine": "refine",
 }
+
+# minimal stopwords — common English + common commit verbs
+_STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "up", "is", "it", "as", "be", "was", "are",
+    "has", "have", "had", "that", "this", "not", "no", "via", "get", "set",
+    "all", "its", "one", "now", "out", "if", "we", "use", "add", "fix",
+    "make", "also", "into", "when", "will", "can", "do", "new", "so", "into",
+}
+
+
+def _tokenize(text: str) -> list[str]:
+    """Split text into lowercase alpha tokens, filter stopwords and short tokens."""
+    tokens = re.findall(r'[A-Za-z][A-Za-z0-9_]*', text)
+    return [t.lower() for t in tokens if len(t) >= 3 and t.lower() not in _STOPWORDS]
+
+
+def _refine_query(
+    original_query: str,
+    original_vec: np.ndarray,
+    backend,
+    dim: int,
+    embedder,
+    refine_top_k: int = 10,
+    refine_top_m: int = 8,
+    min_cosine: float = 0.6,
+) -> tuple[str, np.ndarray]:
+    """Pseudo-relevance feedback: expand query with terms from top-k similar units.
+
+    1. Find top-k semantically similar commits/tasks using the original query vector.
+    2. Tokenize their texts; collect terms absent from the original query.
+    3. Add the top-M most frequent new terms to the query and re-embed.
+    4. Safety check: if cosine(original, expanded) < min_cosine the expansion went
+       in the wrong direction — fall back to original.
+
+    Returns (expanded_query_text, expanded_query_vec).
+    """
+    unit_hits = backend.search_units(original_vec, dim, top_k=refine_top_k)
+    if not unit_hits:
+        return original_query, original_vec
+
+    corpus_text = " ".join(h["text_preview"] for h in unit_hits)
+    original_tokens = set(_tokenize(original_query))
+    new_term_counts = Counter(
+        t for t in _tokenize(corpus_text) if t not in original_tokens
+    )
+    if not new_term_counts:
+        return original_query, original_vec
+
+    expansion_terms = [t for t, _ in new_term_counts.most_common(refine_top_m)]
+    expanded_query = original_query + " " + " ".join(expansion_terms)
+    expanded_vec = embedder.encode([expanded_query])[0]
+
+    # safety: don't expand if direction changes too much
+    orig_n = np.linalg.norm(original_vec)
+    exp_n  = np.linalg.norm(expanded_vec)
+    cos = float(np.dot(original_vec, expanded_vec) / ((orig_n * exp_n) + 1e-9))
+    if cos < min_cosine:
+        return original_query, original_vec
+
+    return expanded_query, expanded_vec
 
 
 def search(
     query: str,
-    mode: str = "task",    # file | task | aggr
+    mode: str = "task",    # file | task | aggr | refine
     sort: str = "rank",    # rank | freq  (task mode only)
     top_n: int = DEFAULT_TOP_N,
     top_k: int = DEFAULT_TOP_K,
     top_m: int = DEFAULT_TOP_M,
     include_diff: bool = False,
+    exclude_blackholes: bool = False,
+    coverage_penalty: float = 0.0,
+    score_blend: float = 1.0,
+    refine_top_k: int = 10,
+    refine_top_m: int = 8,
     project_id: str = "default",
     store_dir: str = STORE_DIR,
     backend_type: str = "numpy",
@@ -50,7 +122,7 @@ def search(
     """
     mode = _MODE_ALIASES.get(mode)
     if mode is None:
-        raise ValueError(f"Unknown mode. Use: file, task, aggr")
+        raise ValueError(f"Unknown mode. Use: file, task, aggr, refine")
 
     backend = make_backend(backend_type, store_dir=store_dir,
                            project_id=project_id, db_url=db_url)
@@ -66,6 +138,8 @@ def search(
     from pathlib import Path
     if mode in ("file", "aggr"):
         idx = Path(store_dir) / project_id / "files.int8"
+    elif mode == "refine":
+        idx = Path(store_dir) / project_id / "units.int8"
     else:
         idx = Path(store_dir) / project_id / "units.int8"
     if not idx.exists() or idx.stat().st_size == 0:
@@ -79,17 +153,26 @@ def search(
     query_vec = embedder.encode([query])[0]  # (dim,) float32
 
     if mode == "file":
-        return _search_file(backend, query_vec, dim, top_n, top_m)
+        return _search_file(backend, query_vec, dim, top_n, top_m, exclude_blackholes, coverage_penalty, score_blend)
     if mode == "task":
         return _search_task(backend, query_vec, dim, top_n, top_k, top_m, sort, include_diff, meta)
     if mode == "aggr":
-        return _search_aggr(backend, query_vec, dim, top_n, top_k, top_m, include_diff, meta)
+        return _search_aggr(backend, query_vec, dim, top_n, top_k, top_m, include_diff, meta, exclude_blackholes, coverage_penalty, score_blend)
+    if mode == "refine":
+        return _search_refine(backend, query, query_vec, dim, embedder, top_n, top_m,
+                              exclude_blackholes, coverage_penalty, score_blend,
+                              refine_top_k, refine_top_m)
 
 
 # ------------------------------------------------------------------ file mode
-def _search_file(backend, query_vec, dim, top_n, top_m) -> dict:
-    results = backend.search_files(query_vec, dim, top_n=top_n * 2)
-    # deduplicate by path, keep max score
+def _search_file(backend, query_vec, dim, top_n, top_m,
+                 exclude_blackholes: bool = False,
+                 coverage_penalty: float = 0.0,
+                 score_blend: float = 1.0) -> dict:
+    results = backend.search_files(query_vec, dim, top_n=top_n * 2,
+                                   exclude_blackholes=exclude_blackholes,
+                                   coverage_penalty=coverage_penalty,
+                                   score_blend=score_blend)
     seen: dict[str, float] = {}
     for r in results:
         p = r["path"]
@@ -133,7 +216,10 @@ def _search_task(backend, query_vec, dim, top_n, top_k, top_m, sort, include_dif
 
 
 # ------------------------------------------------------------------ aggr mode
-def _search_aggr(backend, query_vec, dim, top_n, top_k, top_m, include_diff, meta) -> dict:
+def _search_aggr(backend, query_vec, dim, top_n, top_k, top_m, include_diff, meta,
+                 exclude_blackholes: bool = False,
+                 coverage_penalty: float = 0.0,
+                 score_blend: float = 1.0) -> dict:
     """Average top-k unit vectors → use centroid to search file chunks directly."""
     unit_hits = backend.search_units(query_vec, dim, top_k=top_k)
     if not unit_hits:
@@ -141,16 +227,18 @@ def _search_aggr(backend, query_vec, dim, top_n, top_k, top_m, include_diff, met
                 "mode": "aggr", "sort": None}
 
     db_ids = [h["db_id"] for h in unit_hits]
-    unit_vecs = backend.get_unit_vectors_by_ids(db_ids, dim)  # (K, dim) float32
+    unit_vecs = backend.get_unit_vectors_by_ids(db_ids, dim)
 
-    # weighted average: weight by similarity score
     weights = np.array([h["score"] for h in unit_hits[:len(unit_vecs)]], dtype=np.float32)
     weights /= weights.sum() + 1e-9
     centroid = (unit_vecs * weights[:, None]).sum(axis=0)
     norm = np.linalg.norm(centroid)
     centroid /= norm if norm > 0 else 1.0
 
-    results = backend.search_files(centroid, dim, top_n=top_n * 2)
+    results = backend.search_files(centroid, dim, top_n=top_n * 2,
+                                   exclude_blackholes=exclude_blackholes,
+                                   coverage_penalty=coverage_penalty,
+                                   score_blend=score_blend)
     seen: dict[str, float] = {}
     for r in results:
         p = r["path"]
@@ -165,6 +253,278 @@ def _search_aggr(backend, query_vec, dim, top_n, top_k, top_m, include_diff, met
     units = _build_units(unit_hits, backend, include_diff, meta)
     return {"files": files, "modules": _aggregate_modules(files, top_m),
             "units": units, "mode": "aggr", "sort": None}
+
+
+# ------------------------------------------------------------------ refine mode
+def _search_refine(backend, query, query_vec, dim, embedder, top_n, top_m,
+                   exclude_blackholes, coverage_penalty, score_blend,
+                   refine_top_k, refine_top_m) -> dict:
+    """Pseudo-relevance feedback: expand query, then run file search."""
+    expanded_query, expanded_vec = _refine_query(
+        query, query_vec, backend, dim, embedder,
+        refine_top_k=refine_top_k, refine_top_m=refine_top_m,
+    )
+    result = _search_file(backend, expanded_vec, dim, top_n, top_m,
+                          exclude_blackholes, coverage_penalty, score_blend)
+    result["mode"] = "refine"
+    result["expanded_query"] = expanded_query
+    result["refined"] = expanded_query != query
+    return result
+
+
+# ------------------------------------------------------------------ rrf
+
+def _rrf_merge(ranked_lists: list[list[str]], k: int = 60) -> list[tuple[str, float]]:
+    """Reciprocal Rank Fusion of multiple ranked file lists.
+
+    score(file) = sum( 1/(k + rank_i) ) for each list i that contains the file.
+    Files in multiple lists get multiple addends → rise automatically.
+    Files in only one list stay but score lower.
+
+    Path deduplication: if one path is a suffix of another (e.g. "cop/style/a.rb"
+    vs "lib/cop/style/a.rb"), they are the same file indexed from different base
+    directories. The longer path is used as canonical.
+    """
+    def _norm(p: str) -> str:
+        return p.replace("\\", "/")
+
+    all_paths = list({_norm(p) for ranked in ranked_lists for p in ranked})
+
+    # map each path to its canonical (longest suffix-matching) version
+    canonical: dict[str, str] = {}
+    for p in all_paths:
+        best = p
+        for q in all_paths:
+            if q != p and (q.endswith("/" + p) or p.endswith("/" + q)):
+                best = q if len(q) > len(best) else best
+        canonical[p] = best
+
+    scores: dict[str, float] = {}
+    for ranked in ranked_lists:
+        for rank, path in enumerate(ranked, start=1):
+            canon = canonical.get(_norm(path), _norm(path))
+            scores[canon] = scores.get(canon, 0.0) + 1.0 / (k + rank)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
+def rrf_search(
+    query: str,
+    sources: str = "task:default,file:default",
+    top_n: int = 5,
+    k: int = 60,
+    top_k: int = DEFAULT_TOP_K,
+    sort: str = "freq",
+    score_blend: float = 1.0,
+    coverage_penalty: float = 0.0,
+    store_dir: str = STORE_DIR,
+    backend_type: str = "numpy",
+    db_url: str | None = None,
+) -> dict:
+    """Multi-source search merged with Reciprocal Rank Fusion.
+
+    sources: comma-separated "mode:project_id" pairs
+      "task:default,file:jina"         — task (bge-small) + file (jina-code)
+      "task:default,file:jina,aggr:default" — three-way merge
+
+    Each pair runs an independent search. Results are merged by rank position —
+    raw scores are discarded (cross-model safe: bge-small 0.7 ≠ jina 0.55).
+
+    Returns:
+      files   — RRF-ranked list with rrf_score
+      modules — aggregated modules
+      sources — per-source file lists and any errors
+      k       — damping constant used
+    """
+    parsed = []
+    for part in sources.split(","):
+        part = part.strip()
+        if ":" not in part:
+            raise ValueError(
+                f"Invalid source '{part}'. Expected format: mode:project_id  "
+                f"e.g. task:default or file:jina"
+            )
+        mode, project_id = part.split(":", 1)
+        parsed.append((mode.strip(), project_id.strip()))
+
+    source_results = []
+    for mode, project_id in parsed:
+        try:
+            result = search(
+                query,
+                mode=mode,
+                sort=sort,
+                top_n=top_k,
+                top_k=top_k,
+                score_blend=score_blend,
+                coverage_penalty=coverage_penalty,
+                project_id=project_id,
+                store_dir=store_dir,
+                backend_type=backend_type,
+                db_url=db_url,
+            )
+            source_results.append({
+                "mode": mode,
+                "project_id": project_id,
+                "files": result["files"],
+            })
+        except Exception as e:
+            source_results.append({
+                "mode": mode,
+                "project_id": project_id,
+                "files": [],
+                "error": str(e),
+            })
+
+    ranked_lists = [[f["path"] for f in sr["files"]] for sr in source_results]
+    merged = _rrf_merge(ranked_lists, k=k)
+
+    files = [
+        {"path": p, "score": round(s, 6), "module": module_from_path(p)}
+        for p, s in merged[:top_n]
+    ]
+    return {
+        "files": files,
+        "modules": _aggregate_modules(files, DEFAULT_TOP_M),
+        "sources": source_results,
+        "k": k,
+    }
+
+
+# ------------------------------------------------------------------ retrieve
+
+def retrieve(
+    query: str,
+    mode: str = "file",
+    top_n: int = 5,
+    include_diff: bool = False,
+    exclude_blackholes: bool = False,
+    coverage_penalty: float = 0.0,
+    score_blend: float = 1.0,
+    files_to_fetch: list[str] | None = None,
+    project_id: str = "default",
+    store_dir: str = STORE_DIR,
+    backend_type: str = "numpy",
+    db_url: str | None = None,
+) -> str:
+    """Return formatted text ready to inject into LLM context.
+
+    mode=file  — top-N chunk texts from indexed files
+    mode=task  — full task text + changed files + optional diff
+    mode=aggr  — step 1 (files_to_fetch=None): file list for review;
+                 step 2 (files_to_fetch=[...]): file contents
+    """
+    mode = _MODE_ALIASES.get(mode)
+    if mode is None:
+        raise ValueError("Unknown mode. Use: file, task, aggr")
+
+    backend = make_backend(backend_type, store_dir=store_dir,
+                           project_id=project_id, db_url=db_url)
+    meta = backend.load_meta()
+
+    if mode == "aggr" and files_to_fetch:
+        return _fetch_file_contents(files_to_fetch)
+
+    model_key = meta.get("model_key", DEFAULT_MODEL)
+    dim = meta.get("dim")
+    if not dim:
+        raise ValueError("Index has no dim — re-run index.")
+
+    embedder = get_embedder(model_key)
+    query_vec = embedder.encode([query])[0]
+
+    if mode == "file":
+        return _retrieve_file_chunks(backend, query_vec, dim, top_n, meta, exclude_blackholes, coverage_penalty, score_blend)
+    if mode == "task":
+        return _retrieve_task_texts(backend, query_vec, dim, top_n, include_diff, meta)
+    if mode == "aggr":
+        result = _search_aggr(backend, query_vec, dim, top_n, DEFAULT_TOP_K, DEFAULT_TOP_M,
+                               False, meta, exclude_blackholes, coverage_penalty, score_blend)
+        lines = ["Files matching query (review and select relevant ones):"]
+        for f in result["files"]:
+            lines.append(f"  {f['score']:.3f}  {f['path']}")
+        lines.append('\nTo fetch content: simargl retrieve --mode aggr --files "a.py,b.py" "<query>"')
+        return "\n".join(lines)
+
+
+def _retrieve_file_chunks(backend, query_vec, dim: int, top_n: int, meta: dict,
+                          exclude_blackholes: bool = False,
+                          coverage_penalty: float = 0.0,
+                          score_blend: float = 1.0) -> str:
+    chunk_size = int(meta.get("chunk_size", 400))
+    hits = backend.search_files(query_vec, dim, top_n=top_n * 3,
+                                exclude_blackholes=exclude_blackholes,
+                                coverage_penalty=coverage_penalty,
+                                score_blend=score_blend)
+
+    seen: dict[str, dict] = {}
+    for h in hits:
+        p = h["path"]
+        if p not in seen or h["score"] > seen[p]["score"]:
+            seen[p] = h
+
+    top_hits = sorted(seen.values(), key=lambda x: x["score"], reverse=True)[:top_n]
+
+    parts = []
+    for h in top_hits:
+        try:
+            content = Path(h["path"]).read_text(encoding="utf-8", errors="ignore")
+        except FileNotFoundError:
+            continue
+        chunks = chunk_text(content, chunk_size=chunk_size)
+        chunk_n = h["chunk_n"]
+        text = chunks[chunk_n] if chunk_n < len(chunks) else content
+        parts.append(f"--- {h['path']}  (score: {h['score']:.3f}, chunk {chunk_n}/{len(chunks)}) ---\n{text}")
+
+    return "\n\n".join(parts) if parts else "No results."
+
+
+def _retrieve_task_texts(backend, query_vec, dim: int, top_n: int,
+                         include_diff: bool, meta: dict) -> str:
+    db_path = meta.get("db_path", "")
+    unit_hits = backend.search_units(query_vec, dim, top_k=top_n)
+
+    parts = []
+    for hit in unit_hits:
+        unit_id = hit["unit_id"]
+
+        full_text = hit["text_preview"]
+        if db_path:
+            try:
+                conn = sqlite3.connect(db_path)
+                row = conn.execute(
+                    "SELECT TITLE, DESCRIPTION FROM TASKS WHERE NAME = ?", (unit_id,)
+                ).fetchone()
+                conn.close()
+                if row:
+                    full_text = "\n\n".join(p for p in [row[0] or "", row[1] or ""] if p).strip()
+            except Exception:
+                pass
+
+        uf_list = backend.get_unit_files(unit_id)
+        files = [uf["file_path"] for uf in uf_list]
+
+        section = [f"--- {unit_id}  (score: {hit['score']:.3f}) ---", full_text]
+        if files:
+            section.append(f"\nChanged files: {', '.join(files[:10])}")
+        if include_diff:
+            diff = _fetch_diff(hit, uf_list, meta)
+            if diff:
+                section.append(f"\nDiff:\n{diff[:2000]}")
+
+        parts.append("\n".join(section))
+
+    return "\n\n".join(parts) if parts else "No results."
+
+
+def _fetch_file_contents(files: list[str]) -> str:
+    parts = []
+    for path in files:
+        try:
+            content = Path(path).read_text(encoding="utf-8", errors="ignore")
+            parts.append(f"--- {path} ---\n{content}")
+        except FileNotFoundError:
+            parts.append(f"--- {path} --- [NOT FOUND]")
+    return "\n\n".join(parts)
 
 
 # ------------------------------------------------------------------ helpers

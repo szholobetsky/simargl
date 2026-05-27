@@ -29,6 +29,12 @@ TEXT_EXTENSIONS = {
     ".cpp", ".c", ".h", ".cs", ".rb", ".php", ".scala", ".swift",
     ".sql", ".yaml", ".yml", ".json", ".toml", ".ini", ".cfg",
     ".md", ".txt", ".xml", ".html", ".css",
+    ".adoc", ".asciidoc", ".rst", ".org",
+}
+KNOWN_NAMES = {
+    "Gemfile", "Rakefile", "Makefile", "Dockerfile",
+    "Procfile", "Vagrantfile", "Brewfile", "Justfile",
+    "Capfile", "Guardfile",
 }
 
 
@@ -59,6 +65,11 @@ def index_files(
         try:
             meta = backend.load_meta()
             prev_ts = float(meta.get("indexed_at_ts", 0))
+            # If files.db was deleted manually, reset timestamp so all files
+            # are re-indexed — otherwise mtime check skips everything and
+            # files.db is never recreated.
+            if not backend._path("files.db").exists():
+                prev_ts = 0.0
         except FileNotFoundError:
             pass
 
@@ -79,7 +90,9 @@ def index_files(
         parts = fpath.relative_to(root).parts
         if any(p.startswith(".") or p in SKIP_DIRS for p in parts):
             continue
-        if fpath.is_file() and fpath.suffix.lower() in TEXT_EXTENSIONS:
+        if fpath.is_file() and (
+            fpath.suffix.lower() in TEXT_EXTENSIONS or fpath.name in KNOWN_NAMES
+        ):
             candidates.append(fpath)
 
     indexed = backend.indexed_paths()
@@ -114,7 +127,7 @@ def index_files(
                 rel_paths.append(rel)
                 chunk_ns.append(i)
 
-            if len(texts) >= 256:
+            if len(texts) >= embedder.index_flush_size:
                 if modified_paths:
                     backend.mark_deleted(modified_paths)
                     modified_paths = []
@@ -143,6 +156,7 @@ def index_files(
     meta = {
         "model_key": model_key,
         "dim": embedder.dim,
+        "chunk_size": chunk_size,
         "indexed_at": datetime.datetime.utcnow().isoformat(),
         "indexed_at_ts": now_ts,
     }

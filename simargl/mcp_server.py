@@ -1,4 +1,5 @@
-"""MCP server — tools: find, index_files, index_units, status, vacuum, embedding, distance.
+"""MCP server — tools: find, rrf, retrieve, index_files, index_units, status, vacuum, embedding, distance.
+              prompts: search_task, search_file, search_aggr, search_rrf, search_refine.
 
 Stdio (local):
   simargl-mcp
@@ -30,7 +31,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .config import DEFAULT_MODEL, DEFAULT_TOP_K, DEFAULT_TOP_N, DEFAULT_TOP_M, STORE_DIR
 from .indexer import index_files as _index_files, index_units as _index_units
-from .searcher import search as _search
+from .searcher import search as _search, retrieve as _retrieve, rrf_search as _rrf_search
 from .embedder import get_embedder
 from .backends import make_backend
 
@@ -38,10 +39,14 @@ mcp = FastMCP("simargl")
 
 
 def _resolve(store_dir: str, project_id: str) -> tuple[str, str]:
-    """Apply global defaults if set at server startup."""
+    """Apply global defaults if set at server startup.
+
+    _PROJECT_ID is a default, not an override — if the caller passed an explicit
+    project_id (anything other than "default"), that value takes precedence.
+    """
     return (
         _STORE_DIR if _STORE_DIR != STORE_DIR or store_dir == STORE_DIR else store_dir,
-        _PROJECT_ID if _PROJECT_ID is not None else project_id,
+        _PROJECT_ID if (_PROJECT_ID is not None and project_id == "default") else project_id,
     )
 
 # Server-level backend config — set once via CLI args, used by all tools.
@@ -60,16 +65,34 @@ def find(
     top_k: int = DEFAULT_TOP_K,
     top_m: int = DEFAULT_TOP_M,
     include_diff: bool = False,
+    exclude_blackholes: bool = False,
+    coverage_penalty: float = 0.0,
+    score_blend: float = 1.0,
+    refine_top_k: int = 10,
+    refine_top_m: int = 8,
     project_id: str = "default",
     store_dir: str = STORE_DIR,
 ) -> str:
     """Find files related to a query.
 
-    mode=task  — embed query → similar tasks/commits → files changed in those units
-    mode=file  — embed query → direct cosine search in file chunks
-    mode=aggr  — average top-k unit vectors → centroid cosine search in file chunks
-    sort=rank  — file score = max similarity among matching tasks (task mode only)
-    sort=freq  — file score = count of matching tasks that changed it (task mode only)
+    mode=task   — embed query → similar tasks/commits → files changed in those units
+    mode=file   — embed query → direct cosine search in file chunks
+    mode=aggr   — average top-k unit vectors → centroid cosine search in file chunks
+    mode=refine — pseudo-relevance feedback: find similar commits → extract their
+                  most frequent terms → expand query → file search with expanded query.
+                  Best for natural-language queries that don't use project vocabulary.
+                  refine_top_k: how many commits to use for expansion (default 10)
+                  refine_top_m: how many new terms to add to query (default 8)
+    sort=rank   — file score = max similarity among matching tasks (task mode only)
+    sort=freq   — file score = count of matching tasks that changed it (task mode only)
+
+    score_blend — α in  adjusted = α*max_chunk + (1-α)*mean_chunk  (default 1.0 = off).
+      Focused files (all chunks relevant) are unaffected.
+      Broad documents (relnotes, changelogs) where only one chunk matches are pushed down.
+      Typical range: 0.5-0.8. No pre-computation needed — works at query time.
+
+    coverage_penalty — subtract λ*coverage from scores (0.0 = off).
+      Run blackhole(method="coverage_float") first.
     """
     try:
         store_dir, project_id = _resolve(store_dir, project_id)
@@ -77,13 +100,23 @@ def find(
             query, mode=mode, sort=sort,
             top_n=top_n, top_k=top_k, top_m=top_m,
             include_diff=include_diff,
+            exclude_blackholes=exclude_blackholes,
+            coverage_penalty=coverage_penalty,
+            score_blend=score_blend,
+            refine_top_k=refine_top_k,
+            refine_top_m=refine_top_m,
             project_id=project_id, store_dir=store_dir,
             backend_type=_BACKEND_TYPE, db_url=_DB_URL,
         )
     except Exception as e:
         return f"ERROR: {e}"
 
-    lines = [f"Query: {query}  mode={mode}" + (f"  sort={sort}" if mode == "task" else ""), ""]
+    header = f"Query: {query}  mode={mode}"
+    if mode == "task":
+        header += f"  sort={sort}"
+    if result.get("refined"):
+        header += f"\nExpanded: {result['expanded_query']}"
+    lines = [header, ""]
     lines.append(f"Files (top {top_n}):")
     for f in result["files"]:
         lines.append(f"  {f['score']:.3f}  {f['path']}  [{f['module']}]")
@@ -101,6 +134,105 @@ def find(
                 lines.append(f"    diff:\n{u['diff'][:400]}")
 
     return "\n".join(lines)
+
+
+@mcp.tool()
+def rrf(
+    query: str,
+    sources: str = "task:default,file:default",
+    top_n: int = 5,
+    k: int = 60,
+    sort: str = "freq",
+    score_blend: float = 1.0,
+    store_dir: str = STORE_DIR,
+) -> str:
+    """Merge search results from multiple modes/projects using Reciprocal Rank Fusion.
+
+    sources — comma-separated "mode:project_id" pairs:
+      "task:default,file:jina"              task on bge-small index + file on jina index
+      "task:default,file:jina,aggr:default" three-way merge
+
+    RRF formula: score(file) = sum( 1/(k+rank_i) ) across all sources.
+    Files found by multiple sources rise automatically.
+    Files found by only one source stay in the list but rank lower.
+    Raw scores are discarded — only rank position matters (cross-model safe).
+
+    k=60  standard damping constant. Lower = top ranks dominate more strongly.
+    sort  applies to task sources only: freq (file touched by many commits) or rank.
+    """
+    try:
+        store_dir, _ = _resolve(store_dir, "default")
+        result = _rrf_search(
+            query,
+            sources=sources,
+            top_n=top_n,
+            k=k,
+            top_k=DEFAULT_TOP_K,
+            sort=sort,
+            score_blend=score_blend,
+            store_dir=store_dir,
+            backend_type=_BACKEND_TYPE,
+            db_url=_DB_URL,
+        )
+    except Exception as e:
+        return f"ERROR: {e}"
+
+    lines = [f"Query: {query}", f"Sources: {sources}  k={k}", ""]
+    for sr in result["sources"]:
+        err = sr.get("error", "")
+        status = f"ERROR: {err}" if err else f"{len(sr['files'])} candidates"
+        lines.append(f"  [{sr['mode']}:{sr['project_id']}]  {status}")
+    lines += ["", f"RRF top-{top_n}:"]
+    for f in result["files"]:
+        lines.append(f"  {f['score']:.6f}  {f['path']}  [{f['module']}]")
+    if result["modules"]:
+        lines += ["", "Modules:"]
+        for m in result["modules"]:
+            lines.append(f"  {m['module']}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def retrieve(
+    query: str,
+    mode: str = "file",
+    top_n: int = 5,
+    include_diff: bool = False,
+    exclude_blackholes: bool = False,
+    coverage_penalty: float = 0.0,
+    score_blend: float = 1.0,
+    files: str = "",
+    project_id: str = "default",
+    store_dir: str = STORE_DIR,
+) -> str:
+    """Retrieve text chunks ready for LLM context injection.
+
+    mode=file  — top-N chunk texts from indexed files
+    mode=task  — full task text + changed files + optional diff
+    mode=aggr  — step 1 (files=""): ranked file list for review;
+                 step 2 (files="a.py,b.py"): fetch content of selected files
+    score_blend    — re-ranking by topic concentration (see find tool).
+    coverage_penalty — re-ranking penalty for omnipresent files (see find tool).
+    """
+    try:
+        store_dir, project_id = _resolve(store_dir, project_id)
+        files_list = [f.strip() for f in files.split(",")] if files.strip() else None
+        return _retrieve(
+            query,
+            mode=mode,
+            top_n=top_n,
+            include_diff=include_diff,
+            exclude_blackholes=exclude_blackholes,
+            coverage_penalty=coverage_penalty,
+            score_blend=score_blend,
+            files_to_fetch=files_list,
+            project_id=project_id,
+            store_dir=store_dir,
+            backend_type=_BACKEND_TYPE,
+            db_url=_DB_URL,
+        )
+    except Exception as e:
+        return f"ERROR: {e}"
 
 
 @mcp.tool()
@@ -177,6 +309,87 @@ def status(
             f"Units:    {s.get('units', 0)}  (mode={s.get('unit_mode', '?')})",
             f"Indexed:  {s.get('indexed_at', '?')}",
         ])
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+def blackhole(
+    threshold: float = 0.85,
+    method: str = "centroid",
+    n_queries: int = 100,
+    top_k: int = 20,
+    project_id: str = "default",
+    store_dir: str = STORE_DIR,
+    list_paths: bool = False,
+) -> str:
+    """Detect and mark blackhole files (semantic noise that matches all queries equally).
+
+    method=centroid (default, fast):
+      Marks files whose mean chunk similarity to the corpus centroid exceeds threshold.
+      Good for files with uniformly generic language (logs, boilerplate).
+
+    method=coverage (binary filter):
+      Marks files that appear in top_k results for >= threshold fraction of specific queries.
+      threshold is a fraction [0.0-1.0], e.g. 0.3 = appears in 30% of queries.
+      Risk: may mark core project files that are genuinely central to all tasks.
+
+    method=coverage_float (RECOMMENDED — re-ranking, no binary cutoff):
+      Computes per-file coverage score [0..1] and stores it. Does NOT mark any file as
+      blackhole. Use find/retrieve with coverage_penalty=0.2 to re-rank results.
+      Noise files (relnotes, CHANGELOG) are pushed down; core files stay on top because
+      their raw similarity exceeds the penalty on specific queries.
+
+    Use list_paths=True to see which files are currently marked as binary blackholes.
+    """
+    try:
+        store_dir, project_id = _resolve(store_dir, project_id)
+        backend = make_backend(_BACKEND_TYPE, store_dir=store_dir,
+                               project_id=project_id, db_url=_DB_URL)
+        if list_paths:
+            paths = sorted(backend.blackhole_paths())
+            if not paths:
+                return "No blackhole files marked. Run blackhole(method='centroid') or blackhole(method='coverage') first."
+            return f"Blackhole files ({len(paths)}):\n" + "\n".join(f"  {p}" for p in paths)
+        meta = backend.load_meta()
+        if method == "coverage_float":
+            result = backend.compute_file_coverage(
+                meta["dim"], n_queries=n_queries, top_k=top_k
+            )
+            return (
+                f"Coverage scores computed — project={project_id}\n"
+                f"  Method      : coverage_float (re-ranking, no binary filter)\n"
+                f"  Test queries: {result['n_queries']}\n"
+                f"  Top-k       : {result['top_k']}\n"
+                f"  Total paths : {result['total_paths']}\n"
+                f"  Max coverage: {result['max_coverage']:.4f}\n"
+                f"\nNow use find/retrieve with coverage_penalty=0.2 (or adjust) to re-rank.\n"
+                f"Higher penalty = stronger push-down of omnipresent files."
+            )
+        elif method == "coverage":
+            thr = threshold if threshold is not None else 0.3
+            result = backend.compute_blackholes_coverage(
+                meta["dim"], n_queries=n_queries, threshold=thr, top_k=top_k
+            )
+            return (
+                f"Blackhole detection complete (coverage) — project={project_id}\n"
+                f"  Method     : coverage\n"
+                f"  Threshold  : {result['threshold']} ({int(result['threshold']*result['n_queries'])} / {result['n_queries']} queries)\n"
+                f"  Top-k      : {result['top_k']}\n"
+                f"  Total paths: {result['total_paths']}\n"
+                f"  Marked     : {result['marked']}\n"
+                f"Use find/retrieve with exclude_blackholes=True to filter them out."
+            )
+        else:
+            thr = threshold if threshold is not None else 0.85
+            result = backend.compute_blackholes(meta["dim"], threshold=thr)
+            return (
+                f"Blackhole detection complete (centroid) — project={project_id}\n"
+                f"  Threshold  : {result['threshold']}\n"
+                f"  Total paths: {result['total_paths']}\n"
+                f"  Marked     : {result['marked']}\n"
+                f"Use find/retrieve with exclude_blackholes=True to filter them out."
+            )
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -277,6 +490,80 @@ def distance(
         }, indent=2)
     except Exception as e:
         return f"ERROR: {e}"
+
+
+@mcp.prompt()
+def search_task(query: str) -> str:
+    """Find files relevant to a Jira/GitHub task description.
+
+    Use when you have a natural-language task: bug report, feature request, ticket title.
+    Searches the task/commit index — finds files that were historically changed for similar work.
+    """
+    return (
+        f'Call find(query="{query}", mode="task", sort="freq", top_n=5). '
+        f"sort=freq ranks files by how many similar commits touched them — "
+        f"most historically relevant files rise to the top. "
+        f"Report file paths with scores and explain why each is likely relevant to the task."
+    )
+
+
+@mcp.prompt()
+def search_file(query: str) -> str:
+    """Find files by code content — function names, class names, error messages, patterns.
+
+    Use when you know what you're looking for in the code itself (not what task it belongs to).
+    Searches directly in file chunk embeddings.
+    """
+    return (
+        f'Call find(query="{query}", mode="file", sort="rank", top_n=5). '
+        f"sort=rank gives the file with the highest single-chunk similarity — "
+        f"best for pinpointing exact code locations. "
+        f"Report file paths with scores."
+    )
+
+
+@mcp.prompt()
+def search_aggr(query: str) -> str:
+    """Find affected modules for architecture-level analysis.
+
+    Use when you need a high-level answer: which subsystem or module owns this feature?
+    Aggregates task vectors into a centroid, then searches file chunks with that centroid.
+    """
+    return (
+        f'Call find(query="{query}", mode="aggr", top_n=5, top_m=3). '
+        f"Focus on the Modules section of the result — it shows which subsystems are most affected. "
+        f"Explain which module owns the feature and why."
+    )
+
+
+@mcp.prompt()
+def search_rrf(query: str) -> str:
+    """Most confident file ranking: merges task search + file search via Reciprocal Rank Fusion.
+
+    Use when you want the highest confidence results and have both task and file indexes available.
+    Files that appear in both task-search and file-search results get a ×2 score boost.
+    A file at rank 1 in both sources is almost certainly the right target.
+    """
+    return (
+        f'Call rrf(query="{query}", sources="task:default,file:default", top_n=5). '
+        f"Report the RRF-ranked file list. "
+        f"If a file has score ≥ 0.030 it was found by multiple sources — high confidence. "
+        f"If score < 0.017 it was found by only one source — lower confidence."
+    )
+
+
+@mcp.prompt()
+def search_refine(query: str) -> str:
+    """Vocabulary-expanding search for natural language queries that don't use code terms.
+
+    Use when the query is in business language and the codebase uses technical jargon.
+    Finds similar commits, extracts their most frequent terms, expands the query, then searches files.
+    """
+    return (
+        f'Call find(query="{query}", mode="refine", top_n=5, refine_top_k=10, refine_top_m=8). '
+        f"The result will show an Expanded query line — report it so the user can see "
+        f"what technical terms were added. Then report the matched files."
+    )
 
 
 def main():
