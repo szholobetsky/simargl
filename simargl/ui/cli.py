@@ -181,6 +181,8 @@ def main():
                      help="Topic concentration blend: α*max+(1-α)*mean (e.g. 0.7)")
     ret.add_argument("--files", default=None,
                      help="Comma-separated file paths to fetch content (aggr step 2)")
+    ret.add_argument("--source", default=None, metavar="DIR",
+                     help="Directory where indexed files live (for webindex projects)")
     ret.add_argument("--project", default="default")
     _add_backend_args(ret)
 
@@ -606,11 +608,12 @@ def main():
                 store_dir=args.store_dir,
                 backend_type=args.backend,
                 db_url=args.db_url,
+                source_dir=args.source,
             )
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
-        print(text)
+        sys.stdout.buffer.write((text + "\n").encode("utf-8", errors="replace"))
 
     elif args.cmd == "status":
         from ..backends import make_backend

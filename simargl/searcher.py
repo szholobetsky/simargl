@@ -405,6 +405,7 @@ def retrieve(
     store_dir: str = STORE_DIR,
     backend_type: str = "numpy",
     db_url: str | None = None,
+    source_dir: str | None = None,
 ) -> str:
     """Return formatted text ready to inject into LLM context.
 
@@ -433,7 +434,7 @@ def retrieve(
     query_vec = embedder.encode([query])[0]
 
     if mode == "file":
-        return _retrieve_file_chunks(backend, query_vec, dim, top_n, meta, exclude_blackholes, coverage_penalty, score_blend)
+        return _retrieve_file_chunks(backend, query_vec, dim, top_n, meta, exclude_blackholes, coverage_penalty, score_blend, source_dir=source_dir)
     if mode == "task":
         return _retrieve_task_texts(backend, query_vec, dim, top_n, include_diff, meta)
     if mode == "aggr":
@@ -449,7 +450,8 @@ def retrieve(
 def _retrieve_file_chunks(backend, query_vec, dim: int, top_n: int, meta: dict,
                           exclude_blackholes: bool = False,
                           coverage_penalty: float = 0.0,
-                          score_blend: float = 1.0) -> str:
+                          score_blend: float = 1.0,
+                          source_dir: str | None = None) -> str:
     chunk_size = int(meta.get("chunk_size", 400))
     hits = backend.search_files(query_vec, dim, top_n=top_n * 3,
                                 exclude_blackholes=exclude_blackholes,
@@ -466,9 +468,19 @@ def _retrieve_file_chunks(backend, query_vec, dim: int, top_n: int, meta: dict,
 
     parts = []
     for h in top_hits:
-        try:
-            content = Path(h["path"]).read_text(encoding="utf-8", errors="ignore")
-        except FileNotFoundError:
+        # resolve path: try as-is first, then under source_dir
+        candidates = [Path(h["path"])]
+        if source_dir:
+            candidates.append(Path(source_dir) / Path(h["path"]).name)
+            candidates.append(Path(source_dir) / h["path"])
+        content = None
+        for candidate in candidates:
+            try:
+                content = candidate.read_text(encoding="utf-8", errors="ignore")
+                break
+            except FileNotFoundError:
+                continue
+        if content is None:
             continue
         chunks = chunk_text(content, chunk_size=chunk_size)
         chunk_n = h["chunk_n"]
