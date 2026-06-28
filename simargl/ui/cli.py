@@ -201,6 +201,8 @@ def main():
     ui_p.add_argument("--port", type=int, default=7861)
     ui_p.add_argument("--host", default="0.0.0.0")
     ui_p.add_argument("--store-dir", default=".simargl")
+    ui_p.add_argument("--lang",  default=None, help="UI language (en/uk; default from config)")
+    ui_p.add_argument("--theme", default=None, help="UI theme (Monochrome/Soft/Glass/Ocean/Default)")
 
     # about
     sub.add_parser("about", help="Show version and authorship")
@@ -650,8 +652,12 @@ def main():
             sys.exit(1)
 
     elif args.cmd == "ui":
-        from .gradio_app import main as ui_main
-        ui_main(port=args.port, host=args.host, store_dir=args.store_dir)
+        from .gradio_app import main as ui_main, _load_config
+        cfg   = _load_config()
+        lang  = args.lang  or cfg.get("lang",  "en")
+        theme = args.theme or cfg.get("theme", "Monochrome")
+        ui_main(port=args.port, host=args.host, store_dir=args.store_dir,
+                lang=lang, theme=theme)
 
     elif args.cmd == "serve":
         import sys as _sys
