@@ -1,4 +1,4 @@
-![simargl](images/simargl.png)
+![simargl](https://raw.githubusercontent.com/szholobetsky/simrgl/main/images/logo/simargl.png)
 
 # simargl
 
