@@ -90,6 +90,64 @@ Available model keys:
 
 ---
 
+## Export tasks/commits for a glossary
+
+simargl also doubles as the data-preparation step for `/flow glossary` (1bcoder, vyrii) — it dumps TASKS/COMMITS rows to flat text files that `glossary index` can chunk and extract terms from. `glossary.py` itself never talks to SQLite — it only ever reads folders of files — so this export is the one place in the toolkit that needs to know the TASKS/COMMITS schema.
+
+```bash
+simargl export C:/data/myproject.db --project myproject
+```
+
+With no mode flag this defaults to `--join`: one file per task in `.simargl/myproject/glossary_export/joined/<task>.txt`, combining that task's TITLE/DESCRIPTION (per `--level`) with every commit linked to it via `TASK_NAME` — each commit as its own `--- commit <sha> ---` block (message + per-file diff, filtered per `--diff-mode`). Tasks with no linked commits still get a file (just the task text, no commit block). Commits with no `TASK_NAME` can't be attached to any task and are reported as orphaned/skipped rather than guessed at — the command prints how many.
+
+```
+/flow glossary index .simargl/myproject/glossary_export/joined --project myproject-joined
+```
+
+**Modes** — `--join` (default) / `--all` / `--task` / `--commits`, mutually exclusive:
+
+```bash
+simargl export myproject.db               # --join (default): one file per task+commits
+simargl export myproject.db --all         # tasks/ and commits/ as separate corpora
+simargl export myproject.db --task        # tasks only
+simargl export myproject.db --commits     # commits only
+```
+
+Use `--all` instead of the default when you want tasks and commits as **separate corpora** — a glossary built from tasks and one from commit diffs carry knowledge at a different level, meant to be indexed as separate `--project` namespaces and cross-referenced later rather than pre-combined:
+
+```
+/flow glossary index .simargl/myproject/glossary_export/tasks --project myproject-tasks
+/flow glossary index .simargl/myproject/glossary_export/commits --project myproject-diffs
+```
+
+**Task detail level** — same names as exp3's source variants (title/desc/comments), cumulative:
+
+```bash
+simargl export myproject.db --level title       # TITLE only
+simargl export myproject.db --level desc        # TITLE + DESCRIPTION (default)
+simargl export myproject.db --level comments    # TITLE + DESCRIPTION + COMMENTS
+```
+
+`desc` is the default because title+description consistently outperforms both title-only and the noisier +comments variant in our retrieval experiments.
+
+**Commit diff filtering**:
+
+```bash
+simargl export myproject.db --diff-mode changed   # only +/-/@@ lines (default)
+simargl export myproject.db --diff-mode full      # entire diff as stored
+```
+
+`changed` drops untouched context lines before the text ever reaches glossary chunking — the first line of defense against fact-explosion (every bug would otherwise turn into a handful of glossary "facts" mined from lines that were never actually modified). `--unique` at glossary-index time is the second line of defense.
+
+| param | values | default |
+|---|---|---|
+| `--join` / `--all` / `--task` / `--commits` | mutually-exclusive flags | `--join` |
+| `--level` | `title`, `desc`, `comments` | `desc` |
+| `--diff-mode` | `changed`, `full` | `changed` |
+| `--out` | path | `<store-dir>/<project>/glossary_export` |
+
+---
+
 ## Step 2 — Connect to 1bcoder
 
 Launch 1bcoder from your project directory — the MCP subprocess inherits that working
@@ -285,6 +343,7 @@ Units index is separate — re-run `index units` only when the SQLite is updated
 | `find` | `mode` (tasks\|files), `sort` (rank\|freq), `top_n`, `top_k`, `top_m`, `include_diff` | tasks, rank, 10, 10, 5, false |
 | `index_files` | `path`, `model_key`, `project_id`, `chunk_size` | —, bge-small, default, 400 |
 | `index_units` | `db_path`, `model_key`, `project_id`, `mode` | —, bge-small, default, auto |
+| `export` (CLI only) | `db_path`, `mode` (join\|all\|task\|commits), `level` (title\|desc\|comments), `diff_mode` (changed\|full), `out` | —, join, desc, changed, `<store-dir>/<project>/glossary_export` |
 | `embedding` | `text` or `file`, `project_id` | — |
 | `distance` | `source1`, `source2`, `project_id` | — |
 

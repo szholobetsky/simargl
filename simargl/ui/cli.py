@@ -5,6 +5,8 @@ Usage:
   simargl ingest [--phase git|tasks] [--force]       # extract commits + fetch tasks
   simargl index files <path> [--project P] [--model M]
   simargl index units [--project P] [--model M] [--mode auto|tasks|commits]
+  simargl export <db_path> [--join|--all|--task|--commits] [--level title|desc|comments]
+                 [--diff-mode changed|full] [--project P] [--out DIR]  # default: --join
   simargl search "query" [--mode task|file|aggr] [--sort rank|freq] [--project P]
   simargl status [--project P]
   simargl vacuum [--project P]
@@ -102,6 +104,41 @@ def main():
     idx_units.add_argument("--last", type=int, default=None, metavar="N",
                            help="Index only the N most recent tasks/commits (by commit date)")
     _add_backend_args(idx_units)
+
+    # export — TASKS/COMMITS -> flat text files for /flow glossary index
+    exp = sub.add_parser(
+        "export",
+        help="Export TASKS/COMMITS from SQLite as text files for /flow glossary",
+        description=(
+            "Export TASKS/COMMITS rows from a simargl ingest SQLite db as flat text "
+            "files, for /flow glossary index <dir> (1bcoder/vyrii) to build a term "
+            "glossary from. Pick one mode: --all (tasks and commits as separate "
+            "tasks/ and commits/ subfolders -- default if no mode flag is given; this "
+            "is what /flow history consumes), --join (one file per task, combined "
+            "with every commit linked to it via TASK_NAME, written to <out>/joined/), "
+            "--task (tasks only), or --commits (commits only)."
+        ),
+    )
+    exp.add_argument("db_path")
+    exp.add_argument("--project", default="default")
+    exp.add_argument("--out", default=None,
+                      help="Output directory (default: <store-dir>/<project>/glossary_export)")
+    exp.add_argument("--store-dir", default=".simargl")
+    exp_mode = exp.add_mutually_exclusive_group()
+    exp_mode.add_argument("--task", action="store_true", help="Export tasks only")
+    exp_mode.add_argument("--commits", action="store_true", help="Export commits only")
+    exp_mode.add_argument("--all", action="store_true",
+                          help="Export tasks and commits as separate corpora "
+                               "(tasks/, commits/) -- default if no mode flag is given")
+    exp_mode.add_argument("--join", action="store_true",
+                          help="One file per task, combined with every commit linked "
+                               "to it via TASK_NAME (out_dir/joined/)")
+    exp.add_argument("--level", default="desc", choices=["title", "desc", "comments"],
+                      help="Task detail, cumulative: title | desc (+description) | "
+                           "comments (+comments). Default: desc")
+    exp.add_argument("--diff-mode", default="changed", choices=["changed", "full"],
+                      help="changed = only @/+/- diff lines (default); "
+                           "full = entire diff text as stored")
 
     # download
     dl = sub.add_parser("download", help="Download default embedding model (bge-small)")
@@ -427,6 +464,28 @@ def main():
         )
         last_str = f"  Last: {result['last']}" if result['last'] else ""
         print(f"Done. Units: {result['units_indexed']}  Mode: {result['mode_used']}{last_str}")
+
+    elif args.cmd == "export":
+        import os
+        from ..exporter import export_units
+        if args.task:
+            mode = "task"
+        elif args.commits:
+            mode = "commits"
+        elif args.join:
+            mode = "join"
+        else:
+            mode = "all"  # --all, or no mode flag given (default)
+        out_dir = args.out or os.path.join(args.store_dir, args.project, "glossary_export")
+        result = export_units(args.db_path, out_dir, mode=mode,
+                              level=args.level, diff_mode=args.diff_mode)
+        if mode == "join":
+            print(f"Done. Joined: {result['joined_exported']}  "
+                  f"Commits included: {result['commits_included']}  "
+                  f"Commits orphaned (no TASK_NAME): {result['commits_orphaned']}  -> {out_dir}")
+        else:
+            print(f"Done. Tasks exported: {result['tasks_exported']}  "
+                  f"Commits exported: {result['commits_exported']}  -> {out_dir}")
 
     elif args.cmd == "search":
         import json as _json
