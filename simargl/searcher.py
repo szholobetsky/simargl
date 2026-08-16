@@ -173,14 +173,17 @@ def _search_file(backend, query_vec, dim, top_n, top_m,
                                    exclude_blackholes=exclude_blackholes,
                                    coverage_penalty=coverage_penalty,
                                    score_blend=score_blend)
-    seen: dict[str, float] = {}
+    # keep the chunk_n of the best-scoring chunk per file — callers that need
+    # the actual matched text (not just a ranking) use it via get_chunk_text().
+    seen: dict[str, dict] = {}
     for r in results:
         p = r["path"]
-        if p not in seen or r["score"] > seen[p]:
-            seen[p] = r["score"]
+        if p not in seen or r["score"] > seen[p]["score"]:
+            seen[p] = {"score": r["score"], "chunk_n": r["chunk_n"]}
 
     files = sorted(
-        [{"path": p, "score": s, "module": module_from_path(p)} for p, s in seen.items()],
+        [{"path": p, "score": v["score"], "chunk_n": v["chunk_n"], "module": module_from_path(p)}
+         for p, v in seen.items()],
         key=lambda x: x["score"], reverse=True,
     )[:top_n]
 
@@ -239,14 +242,15 @@ def _search_aggr(backend, query_vec, dim, top_n, top_k, top_m, include_diff, met
                                    exclude_blackholes=exclude_blackholes,
                                    coverage_penalty=coverage_penalty,
                                    score_blend=score_blend)
-    seen: dict[str, float] = {}
+    seen: dict[str, dict] = {}
     for r in results:
         p = r["path"]
-        if p not in seen or r["score"] > seen[p]:
-            seen[p] = r["score"]
+        if p not in seen or r["score"] > seen[p]["score"]:
+            seen[p] = {"score": r["score"], "chunk_n": r["chunk_n"]}
 
     files = sorted(
-        [{"path": p, "score": s, "module": module_from_path(p)} for p, s in seen.items()],
+        [{"path": p, "score": v["score"], "chunk_n": v["chunk_n"], "module": module_from_path(p)}
+         for p, v in seen.items()],
         key=lambda x: x["score"], reverse=True,
     )[:top_n]
 
@@ -447,6 +451,47 @@ def retrieve(
         return "\n".join(lines)
 
 
+def _resolve_and_extract_chunk(path: str, chunk_n: int, chunk_size: int,
+                               source_dir: str | None = None) -> tuple[str | None, int]:
+    """Read `path` (trying source_dir as a fallback base), re-chunk it the same
+    way indexing did, and return (chunk_text, total_chunks). (None, 0) if the
+    file can't be found."""
+    candidates = [Path(path)]
+    if source_dir:
+        candidates.append(Path(source_dir) / Path(path).name)
+        candidates.append(Path(source_dir) / path)
+    content = None
+    for candidate in candidates:
+        try:
+            content = candidate.read_text(encoding="utf-8", errors="ignore")
+            break
+        except FileNotFoundError:
+            continue
+    if content is None:
+        return None, 0
+    chunks = chunk_text(content, chunk_size=chunk_size)
+    text = chunks[chunk_n] if chunk_n < len(chunks) else content
+    return text, len(chunks)
+
+
+def get_chunk_text(path: str, chunk_n: int, project_id: str = "default",
+                   store_dir: str = STORE_DIR, backend_type: str = "numpy",
+                   db_url: str | None = None, source_dir: str | None = None) -> str:
+    """Return the actual chunk text for a (path, chunk_n) pair from search()'s
+    file results — the piece of the file that matched, not the file's head.
+
+    Use together with search(mode="file"): each entry in result["files"] now
+    carries "chunk_n"; pass it here to get real content for LLM context
+    instead of naively reading the first N characters of the file.
+    """
+    backend = make_backend(backend_type, store_dir=store_dir,
+                           project_id=project_id, db_url=db_url)
+    meta = backend.load_meta()
+    chunk_size = int(meta.get("chunk_size", 400))
+    text, _total = _resolve_and_extract_chunk(path, chunk_n, chunk_size, source_dir=source_dir)
+    return text or ""
+
+
 def _retrieve_file_chunks(backend, query_vec, dim: int, top_n: int, meta: dict,
                           exclude_blackholes: bool = False,
                           coverage_penalty: float = 0.0,
@@ -468,24 +513,12 @@ def _retrieve_file_chunks(backend, query_vec, dim: int, top_n: int, meta: dict,
 
     parts = []
     for h in top_hits:
-        # resolve path: try as-is first, then under source_dir
-        candidates = [Path(h["path"])]
-        if source_dir:
-            candidates.append(Path(source_dir) / Path(h["path"]).name)
-            candidates.append(Path(source_dir) / h["path"])
-        content = None
-        for candidate in candidates:
-            try:
-                content = candidate.read_text(encoding="utf-8", errors="ignore")
-                break
-            except FileNotFoundError:
-                continue
-        if content is None:
+        text, total_chunks = _resolve_and_extract_chunk(
+            h["path"], h["chunk_n"], chunk_size, source_dir=source_dir)
+        if text is None:
             continue
-        chunks = chunk_text(content, chunk_size=chunk_size)
         chunk_n = h["chunk_n"]
-        text = chunks[chunk_n] if chunk_n < len(chunks) else content
-        parts.append(f"--- {h['path']}  (score: {h['score']:.3f}, chunk {chunk_n}/{len(chunks)}) ---\n{text}")
+        parts.append(f"--- {h['path']}  (score: {h['score']:.3f}, chunk {chunk_n}/{total_chunks}) ---\n{text}")
 
     return "\n\n".join(parts) if parts else "No results."
 
