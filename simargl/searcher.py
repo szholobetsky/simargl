@@ -16,7 +16,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .config import DEFAULT_MODEL, DEFAULT_TOP_K, DEFAULT_TOP_N, DEFAULT_TOP_M, STORE_DIR
+from . import schema
+from .config import DEFAULT_MODEL, LEGACY_MODEL, DEFAULT_TOP_K, DEFAULT_TOP_N, DEFAULT_TOP_M, STORE_DIR
 from .embedder import get_embedder
 from .backends import make_backend
 from .utils import module_from_path, chunk_text
@@ -129,7 +130,7 @@ def search(
 
     # Load and validate meta BEFORE touching the embedder — fail fast on wrong path/project_id.
     meta = backend.load_meta()
-    model_key = meta.get("model_key", DEFAULT_MODEL)
+    model_key = meta.get("model_key", LEGACY_MODEL)
     dim = meta.get("dim")
     if not dim:
         raise ValueError(f"Index at {store_dir}/{project_id} has no dim — re-run index.")
@@ -429,7 +430,7 @@ def retrieve(
     if mode == "aggr" and files_to_fetch:
         return _fetch_file_contents(files_to_fetch)
 
-    model_key = meta.get("model_key", DEFAULT_MODEL)
+    model_key = meta.get("model_key", LEGACY_MODEL)
     dim = meta.get("dim")
     if not dim:
         raise ValueError("Index has no dim — re-run index.")
@@ -537,7 +538,7 @@ def _retrieve_task_texts(backend, query_vec, dim: int, top_n: int,
             try:
                 conn = sqlite3.connect(db_path)
                 row = conn.execute(
-                    "SELECT TITLE, DESCRIPTION FROM TASKS WHERE NAME = ?", (unit_id,)
+                    f"SELECT TITLE, DESCRIPTION FROM {schema.task_table(conn)} WHERE NAME = ?", (unit_id,)
                 ).fetchone()
                 conn.close()
                 if row:
@@ -611,14 +612,15 @@ def _fetch_diff(hit: dict, uf_list: list[dict], meta: dict) -> str:
             continue
         try:
             conn = sqlite3.connect(db_path)
+            commit_t = schema.commit_table(conn)
             if unit_mode == "tasks":
                 row = conn.execute(
-                    "SELECT DIFF FROM COMMITS WHERE TASK_NAME=? AND PATH=?",
+                    f"SELECT DIFF FROM {commit_t} WHERE TASK_NAME=? AND PATH=?",
                     (hit["unit_id"], uf["file_path"]),
                 ).fetchone()
             else:
                 row = conn.execute(
-                    "SELECT DIFF FROM COMMITS WHERE SHA=? AND PATH=?",
+                    f"SELECT DIFF FROM {commit_t} WHERE SHA=? AND PATH=?",
                     (hit["unit_id"], uf["file_path"]),
                 ).fetchone()
             conn.close()

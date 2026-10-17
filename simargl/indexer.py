@@ -15,6 +15,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
+from . import schema
 from .config import DEFAULT_MODEL, STORE_DIR
 from .embedder import get_embedder
 from .backends import make_backend
@@ -86,9 +87,13 @@ def index_files(
 
     # collect candidate files first so tqdm can show total
     candidates = []
+    store_root = (Path(store_dir) / project_id).resolve() if store_dir else None
     for fpath in root.rglob("*"):
         parts = fpath.relative_to(root).parts
         if any(p.startswith(".") or p in SKIP_DIRS for p in parts):
+            continue
+        # the index's own files (meta.json, ...) when the store lies inside the indexed folder
+        if store_root and store_root in fpath.resolve().parents:
             continue
         if fpath.is_file() and (
             fpath.suffix.lower() in TEXT_EXTENSIONS or fpath.name in KNOWN_NAMES
@@ -188,9 +193,10 @@ def index_units(
 ) -> dict:
     """Index semantic units (tasks or commits) from SQLite.
 
-    mode="auto"    → detect by TASK_NAME coverage in COMMITS table
-    mode="tasks"   → TASKS.TITLE + TASKS.DESCRIPTION
-    mode="commits" → COMMITS.MESSAGE grouped by SHA
+    mode="auto"    → detect by TASK_NAME coverage in the COMMIT table
+    mode="tasks"   → TASK.TITLE + TASK.DESCRIPTION
+    mode="commits" → COMMIT.MESSAGE grouped by SHA
+    Table names are resolved per file (TASK/TASKS, COMMIT/COMMITS) — see schema.py.
     last=N         → use only the N most recent tasks/commits (by commit date)
     """
     embedder = get_embedder(model_key)
@@ -199,15 +205,16 @@ def index_units(
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    task_t, commit_t = schema.tables(conn)
 
     # auto-detect mode
     if mode == "auto":
-        total = conn.execute("SELECT COUNT(*) FROM COMMITS").fetchone()[0]
+        total = conn.execute(f"SELECT COUNT(*) FROM {commit_t}").fetchone()[0]
         if total == 0:
             mode = "tasks"
         else:
             named = conn.execute(
-                "SELECT COUNT(*) FROM COMMITS WHERE TASK_NAME IS NOT NULL AND TASK_NAME != ''"
+                f"SELECT COUNT(*) FROM {commit_t} WHERE TASK_NAME IS NOT NULL AND TASK_NAME != ''"
             ).fetchone()[0]
             mode = "tasks" if (named / total) > 0.5 else "commits"
 
@@ -219,24 +226,24 @@ def index_units(
 
     # SQL fragment that selects the N most-recent task names / SHAs
     _RECENT_TASKS_SQL = (
-        "SELECT TASK_NAME FROM COMMITS WHERE TASK_NAME IS NOT NULL "
+        f"SELECT TASK_NAME FROM {commit_t} WHERE TASK_NAME IS NOT NULL "
         "GROUP BY TASK_NAME ORDER BY MAX(CMT_DATE) DESC LIMIT ?"
     )
     _RECENT_SHA_SQL = (
-        "SELECT SHA FROM COMMITS WHERE SHA IS NOT NULL "
+        f"SELECT SHA FROM {commit_t} WHERE SHA IS NOT NULL "
         "GROUP BY SHA ORDER BY MAX(CMT_DATE) DESC LIMIT ?"
     )
 
     if mode == "tasks":
         if last:
             tasks = conn.execute(
-                f"SELECT NAME, TITLE, DESCRIPTION FROM TASKS "
+                f"SELECT NAME, TITLE, DESCRIPTION FROM {task_t} "
                 f"WHERE NAME IN ({_RECENT_TASKS_SQL})",
                 (last,),
             ).fetchall()
         else:
             tasks = conn.execute(
-                "SELECT NAME, TITLE, DESCRIPTION FROM TASKS"
+                f"SELECT NAME, TITLE, DESCRIPTION FROM {task_t}"
             ).fetchall()
 
         for task in tqdm(tasks, desc="Reading tasks", unit="task"):
@@ -249,14 +256,14 @@ def index_units(
 
         if last:
             rows = conn.execute(
-                f"SELECT TASK_NAME, PATH, SHA FROM COMMITS "
+                f"SELECT TASK_NAME, PATH, SHA FROM {commit_t} "
                 f"WHERE TASK_NAME IS NOT NULL "
                 f"AND TASK_NAME IN ({_RECENT_TASKS_SQL})",
                 (last,),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT TASK_NAME, PATH, SHA FROM COMMITS WHERE TASK_NAME IS NOT NULL"
+                f"SELECT TASK_NAME, PATH, SHA FROM {commit_t} WHERE TASK_NAME IS NOT NULL"
             ).fetchall()
         for r in rows:
             fp = norm_path(r["PATH"])
@@ -266,14 +273,14 @@ def index_units(
     else:  # commits
         if last:
             rows = conn.execute(
-                f"SELECT SHA, MESSAGE, PATH FROM COMMITS "
+                f"SELECT SHA, MESSAGE, PATH FROM {commit_t} "
                 f"WHERE SHA IS NOT NULL AND SHA IN ({_RECENT_SHA_SQL}) "
                 f"GROUP BY SHA",
                 (last,),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT SHA, MESSAGE, PATH FROM COMMITS WHERE SHA IS NOT NULL GROUP BY SHA"
+                f"SELECT SHA, MESSAGE, PATH FROM {commit_t} WHERE SHA IS NOT NULL GROUP BY SHA"
             ).fetchall()
 
         seen_sha: set[str] = set()
@@ -290,13 +297,13 @@ def index_units(
 
         if last:
             all_rows = conn.execute(
-                f"SELECT SHA, PATH FROM COMMITS "
+                f"SELECT SHA, PATH FROM {commit_t} "
                 f"WHERE SHA IS NOT NULL AND SHA IN ({_RECENT_SHA_SQL})",
                 (last,),
             ).fetchall()
         else:
             all_rows = conn.execute(
-                "SELECT SHA, PATH FROM COMMITS WHERE SHA IS NOT NULL"
+                f"SELECT SHA, PATH FROM {commit_t} WHERE SHA IS NOT NULL"
             ).fetchall()
         for r in all_rows:
             fp = norm_path(r["PATH"])

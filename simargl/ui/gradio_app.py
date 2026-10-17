@@ -10,11 +10,12 @@ Tabs:
   RRF       — multi-source Reciprocal Rank Fusion
   Retrieve  — LLM-context text retrieval
   Blackhole — detect / list semantic noise files
-  Status    — index stats + project config (project.yaml + ingest state)
-  Admin     — vacuum / re-index files / re-index units / re-ingest
-  Init      — create project.yaml via form
+  Status    — index stats
+  Admin     — vacuum / re-index files / re-index units
   Settings  — theme and language (saved to ~/.simargl/config.json, restart to apply)
   Download  — export project index as ZIP
+
+The dataset itself (project.yaml, ingest) is mokosh's: `mokosh ui` or `mokosh init` / `mokosh ingest`.
 """
 from __future__ import annotations
 
@@ -187,43 +188,6 @@ def _load_meta_fields(store_dir: str, project_id: str) -> tuple[str, str]:
         return meta.get("db_path", ""), meta.get("model_key", "")
     except Exception:
         return "", ""
-
-
-def _load_project_config(store_dir: str) -> tuple[str, str]:
-    try:
-        import yaml as _yaml
-    except ImportError:
-        return "(yaml not installed)", ""
-
-    yaml_path  = Path(store_dir) / "project.yaml"
-    state_path = Path(store_dir) / "ingest_state.yaml"
-
-    if yaml_path.exists():
-        try:
-            cfg = _yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
-            for section in cfg.values():
-                if isinstance(section, dict):
-                    for k in list(section.keys()):
-                        if any(s in k.lower() for s in ("token", "password", "secret")):
-                            section[k] = "***"
-            yaml_text = _yaml.dump(cfg, default_flow_style=False,
-                                   allow_unicode=True, sort_keys=False)
-        except Exception as e:
-            yaml_text = f"Error reading project.yaml: {e}"
-    else:
-        yaml_text = "(no project.yaml — run: simargl init)"
-
-    if state_path.exists():
-        try:
-            state = _yaml.safe_load(state_path.read_text(encoding="utf-8")) or {}
-            state_text = _yaml.dump(state, default_flow_style=False,
-                                    allow_unicode=True, sort_keys=False)
-        except Exception as e:
-            state_text = f"Error reading ingest_state.yaml: {e}"
-    else:
-        state_text = "(no ingest_state.yaml yet)"
-
-    return yaml_text, state_text
 
 
 # ── subprocess streaming helper ────────────────────────────────────────────────
@@ -401,8 +365,7 @@ def _run_status(store_dir: str, project_id: str) -> tuple[str, str, str]:
     except Exception as e:
         stats_text = f"ERROR: {e}"
 
-    yaml_text, state_text = _load_project_config(store_dir)
-    return stats_text, yaml_text, state_text
+    return stats_text
 
 
 # ── admin runners ──────────────────────────────────────────────────────────────
@@ -450,114 +413,6 @@ def _admin_reindex_files(store_dir, project_id, source_path, model, chunk_size, 
     if full_rebuild:
         cmd.append("--full")
     yield from _iter_subprocess(cmd)
-
-
-def _admin_reingest(store_dir, phase, force):
-    abs_store = os.path.abspath(store_dir)
-    yaml_path = Path(abs_store) / "project.yaml"
-    if not yaml_path.exists():
-        yield (
-            f"project.yaml not found at {yaml_path}\n\n"
-            f"Run 'simargl init' from the project directory first."
-        )
-        return
-    cmd = ["simargl", "ingest", "--store-dir", abs_store]
-    if phase != "both":
-        cmd += ["--phase", phase]
-    if force:
-        cmd.append("--force")
-    yield from _iter_subprocess(cmd)
-
-
-# ── init runner ────────────────────────────────────────────────────────────────
-
-def _init_project(
-    store_dir, overwrite,
-    project_name, db_path, git_repo, branch, since,
-    tracker,
-    jira_url, jira_project, jira_connector, jira_token,
-    gh_owner, gh_repo, gh_token, gh_mask,
-    yt_url, yt_project, yt_token,
-    gl_url, gl_project, gl_token,
-):
-    try:
-        import yaml as _yaml
-    except ImportError:
-        return "ERROR: PyYAML not installed (pip install pyyaml)", ""
-
-    abs_store = os.path.abspath(store_dir)
-    yaml_path = Path(abs_store) / "project.yaml"
-
-    if yaml_path.exists() and not overwrite:
-        existing = yaml_path.read_text(encoding="utf-8")
-        return (
-            f"project.yaml already exists at {yaml_path}\n\n"
-            f"Check 'Force overwrite' to replace it.",
-            existing,
-        )
-
-    name = project_name.strip() or Path(abs_store).parent.name
-    cfg = {
-        "project": {"name": name, "db": db_path.strip() or "units.db"},
-        "git":     {"repo": git_repo.strip() or ".", "branch": branch.strip() or "main"},
-        "ingest":  {"batch_size": 100, "rate_limit_delay": 1.0},
-    }
-    if since.strip():
-        cfg["git"]["since"] = since.strip()
-
-    if tracker == "jira":
-        tc: dict = {
-            "source": "jira",
-            "jira_url": jira_url.strip(),
-            "jira_project": jira_project.strip(),
-            "jira_connector": jira_connector or "api",
-        }
-        if jira_token.strip():
-            tc["jira_token"] = jira_token.strip()
-        cfg["tasks"] = tc
-    elif tracker == "github":
-        tc = {
-            "source": "github",
-            "github_owner": gh_owner.strip(),
-            "github_repo": gh_repo.strip(),
-            "commit_mask": gh_mask or "generic",
-        }
-        if gh_token.strip():
-            tc["github_token"] = gh_token.strip()
-        cfg["tasks"] = tc
-    elif tracker == "youtrack":
-        tc = {
-            "source": "youtrack",
-            "youtrack_url": yt_url.strip() or "https://youtrack.jetbrains.com",
-            "youtrack_project": yt_project.strip(),
-        }
-        if yt_token.strip():
-            tc["youtrack_token"] = yt_token.strip()
-        cfg["tasks"] = tc
-    elif tracker == "gitlab":
-        tc = {
-            "source": "gitlab",
-            "gitlab_url": gl_url.strip() or "https://gitlab.com",
-            "gitlab_project": gl_project.strip(),
-        }
-        if gl_token.strip():
-            tc["gitlab_token"] = gl_token.strip()
-        cfg["tasks"] = tc
-
-    Path(abs_store).mkdir(parents=True, exist_ok=True)
-    yaml_str = _yaml.dump(cfg, default_flow_style=False, allow_unicode=True, sort_keys=False)
-    yaml_path.write_text(yaml_str, encoding="utf-8")
-
-    mode = "full (git + tasks)" if "tasks" in cfg else "commits-only"
-    msg = (
-        f"Created {yaml_path}\n"
-        f"Mode: {mode}\n\n"
-        f"Next steps:\n"
-        f"  1. Admin → Re-ingest  (extract commits + fetch tasks)\n"
-        f"  2. Admin → Re-index units  (embed into vector index)\n"
-        f"  3. Search"
-    )
-    return msg, yaml_str
 
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
@@ -806,17 +661,10 @@ def build_app(store_dir: str = STORE_DIR, lang: str = "en", theme: str = "Monoch
                     st_btn     = gr.Button(t["st_btn"], variant="primary", scale=1)
 
                 st_stats_out = gr.Code(label=t["st_stats_label"], language=None, lines=6)
-                with gr.Row():
-                    with gr.Column():
-                        st_config_out = gr.Code(label=t["st_config_label"],
-                                                language="yaml", lines=20)
-                    with gr.Column():
-                        st_state_out  = gr.Code(label=t["st_state_label"],
-                                                language="yaml", lines=10)
 
                 st_btn.click(_run_status,
                              inputs=[store_dir_box, st_project],
-                             outputs=[st_stats_out, st_config_out, st_state_out])
+                             outputs=[st_stats_out])
                 store_dir_box.change(_refresh_dd, inputs=store_dir_box, outputs=st_project)
 
             # ── Admin ────────────────────────────────────────────────────────
@@ -832,20 +680,6 @@ def build_app(store_dir: str = STORE_DIR, lang: str = "en", theme: str = "Monoch
                     vac_out = gr.Code(label=t["adm_vacuum_out"], language=None, lines=5)
                     vac_btn.click(_admin_vacuum,
                                   inputs=[store_dir_box, adm_project], outputs=vac_out)
-
-                with gr.Accordion(t["adm_ri_title"], open=False):
-                    gr.Markdown(t["adm_ri_desc"])
-                    with gr.Row():
-                        ri_phase = gr.Radio(
-                            choices=["both", "git", "tasks"],
-                            value="both", label=t["adm_ri_phase_label"],
-                        )
-                        ri_force = gr.Checkbox(label=t["adm_ri_force_label"], value=False)
-                    ri_btn = gr.Button(t["adm_ri_btn"], variant="primary")
-                    ri_out = gr.Code(label=t["adm_out_label"], language=None, lines=15)
-                    ri_btn.click(_admin_reingest,
-                                 inputs=[store_dir_box, ri_phase, ri_force],
-                                 outputs=ri_out)
 
                 with gr.Accordion(t["adm_riu_title"], open=False):
                     gr.Markdown(t["adm_riu_desc"])
@@ -891,111 +725,6 @@ def build_app(store_dir: str = STORE_DIR, lang: str = "en", theme: str = "Monoch
                                   inputs=[store_dir_box, adm_project,
                                           rif_path, rif_model, rif_chunk, rif_full],
                                   outputs=rif_out)
-
-            # ── Init ─────────────────────────────────────────────────────────
-            with gr.Tab(t["tab_init"]):
-                gr.Markdown(t["init_desc"])
-
-                with gr.Row():
-                    init_name   = gr.Textbox(label=t["init_name_label"],
-                                             placeholder=project_root.name)
-                    init_db     = gr.Textbox(label=t["init_db_label"], value="units.db")
-                with gr.Row():
-                    init_repo   = gr.Textbox(label=t["init_repo_label"], value=".",
-                                             info=t["init_repo_info"])
-                    init_branch = gr.Textbox(label=t["init_branch_label"], value="main")
-                    init_since  = gr.Textbox(label=t["init_since_label"],
-                                             placeholder=t["init_since_ph"])
-
-                init_tracker = gr.Radio(
-                    choices=["none", "jira", "github", "youtrack", "gitlab"],
-                    value="none", label=t["init_tracker_label"],
-                )
-
-                with gr.Column(visible=False) as init_jira_sec:
-                    gr.Markdown(t["init_jira_header"])
-                    with gr.Row():
-                        init_jira_url  = gr.Textbox(label=t["init_jira_url_label"],
-                                                    placeholder=t["init_jira_url_ph"])
-                        init_jira_proj = gr.Textbox(label=t["init_jira_proj_label"],
-                                                    placeholder=t["init_jira_proj_ph"])
-                    with gr.Row():
-                        init_jira_conn  = gr.Dropdown(
-                            choices=["api", "html", "selenium"], value="api",
-                            label=t["init_jira_conn_label"], info=t["init_jira_conn_info"],
-                        )
-                        init_jira_token = gr.Textbox(label=t["init_jira_token_label"],
-                                                     type="password")
-
-                with gr.Column(visible=False) as init_gh_sec:
-                    gr.Markdown(t["init_gh_header"])
-                    with gr.Row():
-                        init_gh_owner = gr.Textbox(label=t["init_gh_owner_label"],
-                                                   placeholder=t["init_gh_owner_ph"])
-                        init_gh_repo  = gr.Textbox(label=t["init_gh_repo_label"],
-                                                   placeholder=t["init_gh_repo_ph"])
-                    with gr.Row():
-                        init_gh_token = gr.Textbox(label=t["init_gh_token_label"],
-                                                   type="password")
-                        init_gh_mask  = gr.Dropdown(
-                            choices=["generic", "django", "broad"], value="generic",
-                            label=t["init_gh_mask_label"], info=t["init_gh_mask_info"],
-                        )
-
-                with gr.Column(visible=False) as init_yt_sec:
-                    gr.Markdown(t["init_yt_header"])
-                    with gr.Row():
-                        init_yt_url     = gr.Textbox(label=t["init_yt_url_label"],
-                                                     value="https://youtrack.jetbrains.com")
-                        init_yt_project = gr.Textbox(label=t["init_yt_proj_label"],
-                                                     placeholder=t["init_yt_proj_ph"])
-                        init_yt_token   = gr.Textbox(label=t["init_yt_token_label"],
-                                                     type="password")
-
-                with gr.Column(visible=False) as init_gl_sec:
-                    gr.Markdown(t["init_gl_header"])
-                    with gr.Row():
-                        init_gl_url     = gr.Textbox(label=t["init_gl_url_label"],
-                                                     value="https://gitlab.com")
-                        init_gl_project = gr.Textbox(label=t["init_gl_proj_label"],
-                                                     placeholder=t["init_gl_proj_ph"])
-                        init_gl_token   = gr.Textbox(label=t["init_gl_token_label"],
-                                                     type="password")
-
-                def _tracker_change(tracker):
-                    return (
-                        gr.update(visible=tracker == "jira"),
-                        gr.update(visible=tracker == "github"),
-                        gr.update(visible=tracker == "youtrack"),
-                        gr.update(visible=tracker == "gitlab"),
-                    )
-
-                init_tracker.change(
-                    _tracker_change,
-                    inputs=[init_tracker],
-                    outputs=[init_jira_sec, init_gh_sec, init_yt_sec, init_gl_sec],
-                )
-
-                with gr.Row():
-                    init_overwrite = gr.Checkbox(label=t["init_overwrite_label"], value=False)
-                    init_btn = gr.Button(t["init_btn"], variant="primary")
-
-                init_status_out = gr.Code(label=t["init_result_label"], language=None, lines=6)
-                init_yaml_out   = gr.Code(label=t["init_yaml_label"], language="yaml", lines=20)
-
-                init_btn.click(
-                    _init_project,
-                    inputs=[
-                        store_dir_box, init_overwrite,
-                        init_name, init_db, init_repo, init_branch, init_since,
-                        init_tracker,
-                        init_jira_url, init_jira_proj, init_jira_conn, init_jira_token,
-                        init_gh_owner, init_gh_repo, init_gh_token, init_gh_mask,
-                        init_yt_url, init_yt_project, init_yt_token,
-                        init_gl_url, init_gl_project, init_gl_token,
-                    ],
-                    outputs=[init_status_out, init_yaml_out],
-                )
 
             # ── Settings ─────────────────────────────────────────────────────
             with gr.Tab(t["tab_settings"]):

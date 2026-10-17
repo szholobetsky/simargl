@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 from mcp.server.fastmcp import FastMCP
 
-from .config import DEFAULT_MODEL, DEFAULT_TOP_K, DEFAULT_TOP_N, DEFAULT_TOP_M, STORE_DIR
+from .config import DEFAULT_MODEL, LEGACY_MODEL, DEFAULT_TOP_K, DEFAULT_TOP_N, DEFAULT_TOP_M, STORE_DIR
 from .indexer import index_files as _index_files, index_units as _index_units
 from .searcher import search as _search, retrieve as _retrieve, rrf_search as _rrf_search
 from .embedder import get_embedder
@@ -436,7 +436,7 @@ def embedding(
         backend = make_backend(_BACKEND_TYPE, store_dir=store_dir,
                                project_id=project_id, db_url=_DB_URL)
         meta = backend.load_meta()
-        embedder = get_embedder(meta.get("model_key", DEFAULT_MODEL))
+        embedder = get_embedder(meta.get("model_key", LEGACY_MODEL))
 
         source = Path(file).read_text(encoding="utf-8", errors="ignore") if file else text
         if not source:
@@ -472,7 +472,7 @@ def distance(
         backend = make_backend(_BACKEND_TYPE, store_dir=store_dir,
                                project_id=project_id, db_url=_DB_URL)
         meta = backend.load_meta()
-        embedder = get_embedder(meta.get("model_key", DEFAULT_MODEL))
+        embedder = get_embedder(meta.get("model_key", LEGACY_MODEL))
 
         v1, v2 = _resolve_src(source1, embedder), _resolve_src(source2, embedder)
         sim = float(np.dot(v1 / (np.linalg.norm(v1) or 1),
@@ -596,9 +596,9 @@ def main():
         _project = _PROJECT_ID or "default"
         _meta = _mb(_BACKEND_TYPE, store_dir=_STORE_DIR,
                     project_id=_project, db_url=_DB_URL).load_meta()
-        print(f"[simargl] pre-warming model {_meta.get('model_key', DEFAULT_MODEL)} ...",
+        print(f"[simargl] pre-warming model {_meta.get('model_key', LEGACY_MODEL)} ...",
               file=sys.stderr, flush=True)
-        get_embedder(_meta.get("model_key", DEFAULT_MODEL))
+        get_embedder(_meta.get("model_key", LEGACY_MODEL))
         print(f"[simargl] ready — project={_project}  store={_STORE_DIR}", file=sys.stderr, flush=True)
     except Exception as _e:
         print(f"[simargl] warning: could not pre-warm model: {_e}", file=sys.stderr, flush=True)

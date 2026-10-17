@@ -4,693 +4,445 @@
 
 **S**emantic **I**ndex: **M**ap **A**rtifacts, **R**etrieve from **G**it **L**og
 
-Task-to-code retrieval. Given a description of a change, finds which files and modules are likely affected — using semantic similarity over historical tasks or commits.
+Task-to-code retrieval for software projects — given a description of a change, finds the files and modules it is likely to touch, by semantic search over the project's past tasks, commits and code, with local embedding models and no LLM.
 
-Exposes an MCP server (stdio transport) compatible with any MCP-aware agent system.
+## What it does
+
+simargl builds vector indexes of a project:
+
+- **units** — the past tasks (or commits) of the project, each linked to the files it changed,
+  from the SQLite database that [mokosh](https://pypi.org/project/mokosh/) gathers;
+- **files** — the code and documents themselves, cut into chunks.
+
+A new task description is embedded the same way and compared with them. The answer is the files
+and modules most likely to change, the similar past tasks behind them, and, if asked, their diffs.
+
+Around that it offers:
+
+- **search** in several modes: past tasks, code chunks, tasks averaged per file, and a query
+  refined with the words of similar commits;
+- **rrf** — several indexes merged by rank;
+- **retrieve** — the matching text, ready to put into an LLM's context;
+- **blackhole** — detect files that answer almost any query (generated files, changelogs) and push
+  them down;
+- **ui** — the same in the browser, plus **Triangulation**: one task asked of simargl,
+  [gamayun](https://pypi.org/project/gamayun-ontology/) and [svitovyd](https://pypi.org/project/svitovyd/)
+  at once;
+- **an MCP server**, so AI agents can search the history and the code themselves.
+
+Embeddings run through Ollama, any OpenAI-compatible local server, or sentence-transformers. The
+index is a few plain files (int8 vectors and SQLite), and nothing leaves the machine.
+
+---
+
+## Statement of need
+
+Most of what a developer needs to know about a new task is in the project's history: someone has
+done something similar before, and the files they changed are where the new change will go. Plain
+text search finds only the exact words, and a task is rarely written in the words of the code.
+Code assistants that read the whole repository need a large model and send the code to it.
+
+simargl searches the history by meaning, with small embedding models that run on a CPU, and points
+to files, not only to past tasks. It is meant for:
+
+- **developers** who need to find where a task leads in a large or unfamiliar code base;
+- **AI coding agents**, including ones on small local models, that need the right files before
+  they read anything (through the MCP server or the command line);
+- **researchers in software engineering** who study task-to-code retrieval and change impact and
+  need a reproducible retrieval baseline over real project histories.
 
 ---
 
 ## Install
 
 ```bash
-pip install simargl
+pip install simargl              # core + web UI: numpy, Flask, mokosh — no torch
+pip install "simargl[torch]"     # + local models via sentence-transformers (bge-small, bge-large, jina-code)
+pip install "simargl[mcp]"       # + the MCP server (simargl serve, simargl-mcp)
+pip install "simargl[http]"      # + MCP over HTTP/SSE (remote agents, LAN)
+pip install "simargl[postgres]"  # + the PostgreSQL / pgvector backend
+pip install "simargl[gradio]"    # + the older Gradio UI (simargl ui --gradio)
+pip install "simargl[all]"       # torch + MCP + HTTP
 ```
 
-The default embedding model (`bge-small`, ~130MB) is downloaded automatically during install.
-If that fails or you installed offline, download it manually:
-
-```bash
-simargl download
-```
+Python 3.10+. The core has no torch, so it installs anywhere Python runs; the embedding model can
+run in Ollama on the same machine or another one.
 
 ---
 
-## Step 1 — Index your project
-
-You need two indexes: one for code files, one for tasks (or commits if no tracker).
+## Quick start
 
 ```bash
-# Index code files (walks the repo, chunks text files, stores vectors)
-simargl index files C:/repos/sonar
+cd my-project                              # a git clone
+mokosh init && mokosh ingest               # past tasks + commits -> units.db (installed with simargl)
 
-# Index tasks from SQLite (auto-detects tasks vs commits)
-simargl index units C:/data/sonar.db
-
-# Check what was indexed
+simargl download                           # pull the default embedding model into Ollama
+simargl index units units.db               # the past tasks
+simargl index files .                      # the code
 simargl status
+
+simargl search "Login fails after the session expires"
+simargl search "Login fails after the session expires" --mode file
+simargl ui                                 # http://127.0.0.1:8099/
 ```
 
-Both indexes land in `.simargl/default/` relative to your working directory.
-
-If you want to index only part of the repo, or keep two sub-projects separate, use `--project`:
-
-```bash
-simargl index files C:/repos/sonar/server --project server
-simargl index units C:/data/sonar.db --project server
-simargl status --project server
-```
-
-Each project stores its vectors in `.simargl/{project}/` independently.
-
-**`--last N` — index only recent history**
-
-For large repositories where development is continuous, the most recent tasks or commits describe the current codebase better than the full history. Use `--last` to limit the units index to the N most recent tasks (or commits), ordered by commit date:
-
-```bash
-simargl index units C:/data/sonar.db --last 1000
-simargl index units C:/data/kafka.db --last 500 --mode commits
-```
-
-This is especially useful for `aggr` search mode, which averages unit vectors per file — recent units produce a more focused signal than a full multi-year history.
-
-According to our research, `--last 1000` produces better retrieval quality than either `--last 100` (too narrow) or `--last 10000` (too much noise from distant history). 1000 recent tasks is a good default for actively developed projects.
-
-*(experiment data and article links will be added here after publication)*
-
-Use `--model bge-large` if you need higher accuracy (uses more RAM and disk).
-
-Available model keys:
-
-```bash
-# sentence-transformers — runs locally, CPU or GPU, downloads model on first use
---model bge-small                                  # default, 384 dims
---model bge-large                                  # better quality, 1024 dims
-
-# Ollama — no model download, uses whatever is already pulled in Ollama
---model ollama://nomic-embed-text                  # localhost:11434
---model ollama://nomic-embed-text@192.168.1.10     # remote machine
-
-# OpenAI-compatible local server — LM Studio, llama.cpp, LiteLLM, Jan, Koboldcpp
---model openai://localhost:1234/nomic-embed-text   # LM Studio
---model openai://localhost:8080/all-minilm         # llama.cpp server
---model openai://localhost:4000/nomic-embed-text   # LiteLLM
-```
-
-`openai://` means OpenAI-compatible API — no cloud, no API key, runs entirely locally.
+Both indexes go to `.simargl/default/` in the current folder. To refresh: `mokosh ingest`, then
+`simargl index units` again; `simargl index files .` re-embeds only the files changed since the
+last run.
 
 ---
 
-## Export tasks/commits for a glossary
+## Commands
 
-simargl also doubles as the data-preparation step for `/flow glossary` (1bcoder, vyrii) — it dumps TASKS/COMMITS rows to flat text files that `glossary index` can chunk and extract terms from. `glossary.py` itself never talks to SQLite — it only ever reads folders of files — so this export is the one place in the toolkit that needs to know the TASKS/COMMITS schema.
+| Command | What it does |
+|---|---|
+| `simargl index units DB [--last N] [--mode auto\|tasks\|commits]` | Index the past tasks (or commits) of a mokosh database |
+| `simargl index files PATH [--full] [--chunk-size N]` | Index code and documents (incremental; `--full` re-embeds everything) |
+| `simargl search QUERY [--mode task\|file\|aggr\|refine]` | Files, modules and similar past tasks for a query |
+| `simargl rrf QUERY --sources task:default,file:code` | Several indexes or modes merged by reciprocal rank fusion |
+| `simargl retrieve QUERY` | The matching text, ready for an LLM's context |
+| `simargl blackhole [--method coverage_float] [--list]` | Detect files that answer almost any query |
+| `simargl status` | What an index holds |
+| `simargl vacuum` | Reclaim the space of deleted vectors |
+| `simargl download [--model M]` | Get an embedding model ready |
+| `simargl ui [--port 8099] [--host 0.0.0.0] [--root FOLDER]` | The web UI |
+| `simargl serve [--http --port 8765]` | The MCP server (also `simargl-mcp`) |
+| `simargl about` | Version and authorship |
 
-```bash
-simargl export C:/data/myproject.db --project myproject
-```
+Common options: `--project P` keeps several indexes side by side (`.simargl/<P>/`), `--model M`
+picks the embedding model, `--store-dir DIR` puts the store elsewhere, `--format json|paths|modules`
+changes the output of `search`, `--diff` adds the diffs of the past tasks, `--top-n` / `--top-k` set
+how many files and past tasks to return.
 
-With no mode flag this defaults to `--join`: one file per task in `.simargl/myproject/glossary_export/joined/<task>.txt`, combining that task's TITLE/DESCRIPTION (per `--level`) with every commit linked to it via `TASK_NAME` — each commit as its own `--- commit <sha> ---` block (message + per-file diff, filtered per `--diff-mode`). Tasks with no linked commits still get a file (just the task text, no commit block). Commits with no `TASK_NAME` can't be attached to any task and are reported as orphaned/skipped rather than guessed at — the command prints how many.
+### Search modes
 
-```
-/flow glossary index .simargl/myproject/glossary_export/joined --project myproject-joined
-```
+| Mode | How it finds files |
+|---|---|
+| `task` (default) | finds the most similar past tasks and returns the files they changed (`--sort rank` by similarity, `--sort freq` by how many of them changed the file) |
+| `file` | compares the query with the chunks of the code itself |
+| `aggr` | compares the query with every file's average over the past tasks that changed it |
+| `refine` | expands the query with words from the most similar commits, then searches again |
 
-**Modes** — `--join` (default) / `--all` / `--task` / `--commits`, mutually exclusive:
-
-```bash
-simargl export myproject.db               # --join (default): one file per task+commits
-simargl export myproject.db --all         # tasks/ and commits/ as separate corpora
-simargl export myproject.db --task        # tasks only
-simargl export myproject.db --commits     # commits only
-```
-
-Use `--all` instead of the default when you want tasks and commits as **separate corpora** — a glossary built from tasks and one from commit diffs carry knowledge at a different level, meant to be indexed as separate `--project` namespaces and cross-referenced later rather than pre-combined:
-
-```
-/flow glossary index .simargl/myproject/glossary_export/tasks --project myproject-tasks
-/flow glossary index .simargl/myproject/glossary_export/commits --project myproject-diffs
-```
-
-**Task detail level** — same names as exp3's source variants (title/desc/comments), cumulative:
-
-```bash
-simargl export myproject.db --level title       # TITLE only
-simargl export myproject.db --level desc        # TITLE + DESCRIPTION (default)
-simargl export myproject.db --level comments    # TITLE + DESCRIPTION + COMMENTS
-```
-
-`desc` is the default because title+description consistently outperforms both title-only and the noisier +comments variant in our retrieval experiments.
-
-**Commit diff filtering**:
-
-```bash
-simargl export myproject.db --diff-mode changed   # only +/-/@@ lines (default)
-simargl export myproject.db --diff-mode full      # entire diff as stored
-```
-
-`changed` drops untouched context lines before the text ever reaches glossary chunking — the first line of defense against fact-explosion (every bug would otherwise turn into a handful of glossary "facts" mined from lines that were never actually modified). `--unique` at glossary-index time is the second line of defense.
-
-| param | values | default |
-|---|---|---|
-| `--join` / `--all` / `--task` / `--commits` | mutually-exclusive flags | `--join` |
-| `--level` | `title`, `desc`, `comments` | `desc` |
-| `--diff-mode` | `changed`, `full` | `changed` |
-| `--out` | path | `<store-dir>/<project>/glossary_export` |
+`--last N` indexes only the N most recent tasks: in a project developed for years, recent work
+describes today's code better than the whole history.
 
 ---
 
-## Step 2 — Connect to 1bcoder
+## Example
 
-Launch 1bcoder from your project directory — the MCP subprocess inherits that working
-directory, so `.simargl` resolves correctly with no extra flags.
-
-```bash
-cd C:/Project/my-app
-1bcoder
-```
-
-If you indexed with the default project_id (no `--project` flag):
-```
-/mcp connect simargl simargl-mcp
-```
-
-If you indexed with a custom project_id:
-```
-/mcp connect simargl simargl-mcp --project-id bookcrossing
-```
-
-The first connect takes 30–60 s while the embedding model loads — this is normal.
-Tool calls are instant after that.
-
-To connect to a project in a different directory without restarting 1bcoder, use `--cwd`:
-```
-/mcp connect simargl simargl-mcp --cwd C:/Project/other-app --project-id myproject
-```
-
-Check it connected:
+The output below comes from a small demo shop project: 300 synthetic tasks built from a few dozen
+titles, and 13 Java files in the modules auth, checkout, billing and catalog.
 
 ```
-/mcp tools simargl
+$ simargl search "Customers are charged twice when two discount codes are used" --top-n 3 --top-k 5 --sort freq
+Query: Customers are charged twice when two discount codes are used  mode=task  sort=freq
+
+Files:
+  4.000  checkout/src/PriceCalculator.java  [checkout]
+  1.000  checkout/src/DiscountRule.java  [checkout]
+
+Modules:
+  4.000  checkout
+
+Similar units:
+  [0.766] SHOP-194 — Two discounts applied to one item
+  [0.766] SHOP-236 — Two discounts applied to one item
+  [0.766] SHOP-141 — Two discounts applied to one item
+  [0.766] SHOP-217 — Two discounts applied to one item
+  [0.766] SHOP-103 — Two discounts applied to one item
 ```
 
-You should see: `find`, `index_files`, `index_units`, `status`, `vacuum`, `embedding`, `distance`.
-
-With `--project-id` set at server startup, you never need to pass `project_id` in tool calls.
+The five most similar past tasks were found, and the files they changed are counted: four of them
+changed `PriceCalculator.java`, one `DiscountRule.java`.
 
 ---
 
-## Step 3 — Index
+## Embedding models
 
-1bcoder MCP call syntax is `/mcp call server/tool {json_args}`.
+New indexes use `ollama://granite-embedding:30m` (63 MB, 384 dimensions) unless `--model` says
+otherwise. An index records its model in `meta.json`, and every search uses that model again.
 
-```
-/mcp call simargl/index_files {"path": "C:/Project/my-app"}
+```bash
+# Ollama: uses what is pulled into Ollama, on this machine or another
+--model ollama://granite-embedding:30m            # default
+--model ollama://nomic-embed-text
+--model ollama://nomic-embed-text@192.168.1.10    # Ollama on another machine
+
+# OpenAI-compatible local servers: LM Studio, llama.cpp, LiteLLM, Jan, Koboldcpp
+--model openai://localhost:1234/nomic-embed-text  # LM Studio
+--model openai://localhost:8080/all-minilm        # llama.cpp server
+
+# sentence-transformers (needs simargl[torch]); usually the fastest for indexing a large history
+--model bge-small                                 # 384 dimensions
+--model bge-large                                 # 1024 dimensions, more RAM and disk
 ```
 
-If you have a task SQLite (Jira/GitHub export):
-```
-/mcp call simargl/index_units {"db_path": "C:/data/myproject.db"}
-```
-
-Check what was indexed:
-```
-/mcp call simargl/status {}
-```
+`openai://` means an OpenAI-compatible API on your own machine: no cloud and no API key.
+`simargl download --model M` gets a model ready (pulls it into Ollama, or downloads a local one).
 
 ---
 
-## Step 4 — Search
+## Web UI
 
-The call syntax is always `/mcp call simargl/tool {json}`.
-
-### Find files related to a description
-
-```
-/mcp call simargl/find {"query": "make author field longer in the book class"}
+```bash
+simargl ui                          # http://127.0.0.1:8099/
+simargl ui --host 0.0.0.0           # reachable from other devices on the LAN
+simargl ui --root ~/projects        # look for .simargl stores under this folder
 ```
 
-Default mode is `task` + `sort=rank`. If you only indexed files (no task SQLite), use `mode=file`:
+The UI lists the `.simargl` stores under the folder it was started in and remembers every store
+opened there or indexed by the CLI (`~/.simargl/stores.json`). One store and one index are worked on
+at a time.
 
-```
-/mcp call simargl/find {"query": "make author field longer in the book class", "mode": "file"}
-```
+- **Search:** every mode and parameter; files with score bars, modules, the similar past tasks with
+  their diffs, and the answer as a map: the similar tasks and the files they changed, so the files
+  many of them share stand out.
+- **Triangulation:** one task asked of three tools at once: simargl (similar past tasks), gamayun
+  (words that significantly lead to files, files that change together) and svitovyd (identifiers
+  of the task that the code defines). Their answers are merged by equal-weight reciprocal rank
+  fusion; each file shows its rank in every tool, and a strip shows how many files all three, two
+  or one of them named. With a svitovyd map, a path the history remembers but today's code no
+  longer has is matched to the moved file or marked *not in today's code*. With a gamayun project,
+  a file that changes with at least 1 % of all past tasks (a messages file, the build) is marked a
+  *companion*: often part of a change, rarely its core.
+- **RRF:** several sources (`task:default`, `file:code`, …) merged by rank.
+- **Retrieve:** the matching text, ready for an LLM.
+- **Blackholes:** files that answer almost any query.
+- **Index:** the embedding models (what each Ollama host has, pull a model), index the history or
+  the code, vacuum.
+- **Status:** what the index holds, and the whole index as a ZIP to search it on another machine
+  without re-indexing.
 
-### All parameters
-
-```
-/mcp call simargl/find {
-  "query": "make author field longer in the book class",
-  "mode": "file",
-  "top_n": 10
-}
-```
-
-| param | values | default |
-|---|---|---|
-| `mode` | `task`, `file`, `aggr` | `task` |
-| `sort` | `rank`, `freq` | `rank` |
-| `top_n` | integer | 10 |
-| `top_k` | integer | 10 |
-| `include_diff` | true/false | false |
-| `project_id` | string | `default` |
-| `store_dir` | path | `.simargl` |
-
-### If you used a custom project_id at index time
-
-```
-/mcp call simargl/find {"query": "add author field", "project_id": "bookcrossing"}
-```
-
-To avoid passing `project_id` every time, re-index without it (uses `default`):
-```
-/mcp call simargl/index_files {"path": "C:/Project/my-app"}
-```
+The UI has 8 colour themes and 6 languages (English, Ukrainian, German, French, Spanish,
+Portuguese). The task database itself is set up in `mokosh ui`.
 
 ---
 
-## Typical 1bcoder workflow
-
-```
-# 1. Find files
-/mcp call simargl/find {"query": "make author field longer in the book class", "mode": "file"} -> find_result
-/var set find_files matches
-
-# 2. Read the most relevant files
-/read {{find_files}}
-
-# 3. Ask the model
-make the author field longer in the Book class
-
-# 4. Apply
-/patch models.py code
-```
-
----
-
-## Other tools
-
-### Check index status
-
-```
-/mcp call simargl/status {}
-/mcp call simargl/status {"project_id": "bookcrossing"}
-```
-
-### Compute embedding for any text
-
-```
-/mcp call simargl/embedding {"text": "add user authentication to login flow"} -> vector1
-```
-
-Stores the vector as `{{vector1}}`. Use later with `distance`.
-
-### Measure semantic distance between two things
-
-```
-/mcp call simargl/distance {"source1": "auth.py", "source2": "views.py"}
-/mcp call simargl/distance {"source1": "add user auth", "source2": "auth.py"}
-```
-
-Returns cosine similarity (0–1).
-
-### Vacuum (reclaim disk after many incremental re-indexes)
-
-```
-/mcp call simargl/vacuum {}
-```
-
-### Re-index after code changes
+## MCP server
 
 ```bash
-# Incremental (default) — only processes files modified since last run
-simargl index files C:/repos/sonar --project sonar
-
-# Full reindex — re-embeds everything regardless of mtime
-simargl index files C:/repos/sonar --project sonar --full
+simargl-mcp                                # stdio, for local agents
+simargl-mcp --http --port 8765             # HTTP/SSE, for remote agents and the LAN
+simargl-mcp --store-dir /path/to/my-project/.simargl --project-id myproj
 ```
 
-Incremental index uses `mtime` comparison against the previous `indexed_at` timestamp:
-- unchanged files → skipped
-- modified files → old chunks soft-deleted, new chunks appended
-- deleted files → chunks soft-deleted
+| Tool | What it does |
+|---|---|
+| `find` | files, modules and similar past tasks for a query (`mode`, `sort`, `top_n`, `top_k`, `include_diff`) |
+| `rrf` | several sources merged by rank |
+| `retrieve` | the matching text for an LLM's context |
+| `index_files`, `index_units` | build or update an index |
+| `status`, `vacuum`, `blackhole` | the index itself |
+| `embedding`, `distance` | the vector of a text or file, and the cosine similarity of two |
 
-Soft-deleted vectors stay in the int8 file until you vacuum. Run vacuum periodically
-(e.g. after a big refactor) to reclaim disk space:
+The first connection takes 30–60 seconds while the embedding model loads; later calls are fast.
+Pass `--store-dir` with an absolute path, so the server finds `.simargl/` whatever folder the agent
+starts it in. With `--project-id` set, the tools need no `project_id` argument.
 
-```bash
-simargl vacuum --project sonar
-# or from 1bcoder:
-/mcp simargl vacuum
-```
+### Setup per agent
 
-Units index is separate — re-run `index units` only when the SQLite is updated.
-
----
-
-## Parameters reference
-
-| Tool | Key params | Default |
-|---|---|---|
-| `find` | `mode` (tasks\|files), `sort` (rank\|freq), `top_n`, `top_k`, `top_m`, `include_diff` | tasks, rank, 10, 10, 5, false |
-| `index_files` | `path`, `model_key`, `project_id`, `chunk_size` | —, bge-small, default, 400 |
-| `index_units` | `db_path`, `model_key`, `project_id`, `mode` | —, bge-small, default, auto |
-| `export` (CLI only) | `db_path`, `mode` (join\|all\|task\|commits), `level` (title\|desc\|comments), `diff_mode` (changed\|full), `out` | —, join, desc, changed, `<store-dir>/<project>/glossary_export` |
-| `embedding` | `text` or `file`, `project_id` | — |
-| `distance` | `source1`, `source2`, `project_id` | — |
-
----
-
-## Multiple projects
-
-```bash
-simargl index units kafka.db --project kafka
-simargl index files C:/repos/kafka --project kafka
-```
-
-```
-/mcp simargl find "add partition rebalance" project_id=kafka
-/mcp simargl status project_id=kafka
-```
-
-Each project stores its vectors in `.simargl/{project_id}/` independently.
-
----
-
-## Running on a dedicated machine or phone — LAN access
-
-simargl can run on any machine on your LAN: a dedicated server, a Raspberry Pi, or an Android phone via Termux. The index, embedding model, MCP server, and web UI all run there — the laptop just opens a browser or connects an agent.
-
-### Web UI over LAN
-
-The web UI binds to `0.0.0.0` by default, so it is immediately visible on the local network:
-
-```bash
-# on the server / phone
-simargl ui --port 7860
-
-# on any browser in the same LAN
-http://192.168.1.42:7860
-```
-
-Install the UI extra if not already present:
-```bash
-pip install "simargl[ui]"
-```
-
-Keep it running in the background with tmux or nohup (see below). The UI lets you search all indexed projects, switch mode/sort, and browse results — no agent or CLI needed on the client side.
-
-The UI includes a **Download index** section (collapsed accordion at the bottom). Select a project and click **Prepare ZIP** to download the full index (all six files: `files.int8`, `files.db`, `units.int8`, `units.db`, `unit_files.db`, `meta.json`) as a single ZIP. Extract it as `.simargl/` on your local machine and run `simargl search` or `simargl status` without re-indexing.
-
-```bash
-unzip default.zip -d .simargl/
-simargl status
-simargl search "add author field to Book class"
-```
-
----
-
-### Android (Termux) — full setup
-
-With 8GB+ RAM Ollama + nomic-embed-text + simargl all fit comfortably on the phone. The laptop connects over LAN — no cloud, no GPU, everything local.
-
-#### Phone setup (Termux)
-
-```bash
-# base tools
-pkg update && pkg install python git
-
-# Ollama for Android (ARM64)
-pkg install ollama
-ollama serve &
-ollama pull nomic-embed-text      # 274MB embedding model
-# optional: ollama pull nemotron-mini  (if you want LLM on phone too)
-
-# simargl
-pip install simargl
-pip install simargl[http]         # adds starlette + uvicorn for LAN transport
-
-# index your project (copy SQLite and repo to phone storage first)
-simargl index units /sdcard/data/sonar.db \
-    --project sonar \
-    --model ollama://nomic-embed-text
-
-simargl index files /sdcard/repos/sonar \
-    --project sonar \
-    --model ollama://nomic-embed-text
-
-# start MCP server on LAN
-simargl-mcp --http --port 8765
-# → simargl MCP server — http://0.0.0.0:8765/sse
-```
-
-#### Laptop — connect to phone
-
-Find phone IP: `ip addr` in Termux or check Wi-Fi settings.
-
-**1bcoder:**
-```
-/mcp connect simargl http://192.168.1.42:8765/sse
-/mcp tools simargl
-```
-
-**Claude Desktop** (`claude_desktop_config.json`):
-```json
-{
-  "mcpServers": {
-    "simargl": {
-      "url": "http://192.168.1.42:8765/sse"
-    }
-  }
-}
-```
-
-**Claude Code / OpenCode / Cursor** — same URL pattern, see agent-specific config above.
-
-#### Keep server running in Termux background
-
-```bash
-# run in background, log to file
-nohup simargl-mcp --http --port 8765 > ~/.simargl-mcp.log 2>&1 &
-
-# or use tmux (pkg install tmux)
-tmux new -s simargl
-simargl-mcp --http --port 8765
-# Ctrl+B D  to detach
-```
-
-#### What runs where
-
-| Component | Server / phone | Laptop / client |
-|---|---|---|
-| Vector index (.simargl/) | yes | — |
-| Embedding model | yes (Ollama) | — |
-| MCP server (simargl-mcp) | yes | — |
-| Web UI (simargl ui) | yes | browser only |
-| Agent / LLM (1bcoder, Claude) | — | yes |
-| Repo source files | yes (for indexing) | yes (for editing) |
-
-The phone stores the index and computes embeddings. The laptop runs the agent and edits code.
-Both use the same `.simargl/` directory — if you prefer, mount phone storage via sshfs
-so the laptop can also run `simargl index` directly against it.
-
----
-
-## Connecting to agent systems
-
-simargl-mcp uses **stdio transport** — the universal MCP default. Always pass `--store-dir`
-with the absolute path to your project root so the subprocess always finds `.simargl/`
-regardless of which directory the agent system uses as its working directory.
-
-### Claude Desktop
-
-Config file:
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+**Claude Desktop** (`%APPDATA%\Claude\claude_desktop_config.json` on Windows,
+`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS) and **Claude Code**
+(`~/.claude/settings.json`):
 
 ```json
 {
   "mcpServers": {
     "simargl": {
       "command": "simargl-mcp",
-      "args": ["--store-dir", "C:/repos/sonar/.simargl", "--project-id", "sonar"]
+      "args": ["--store-dir", "/path/to/my-project/.simargl", "--project-id", "myproj"]
     }
   }
 }
 ```
 
-Restart Claude Desktop after editing. Tools appear automatically in the UI.
+Claude Code can also add it from a session:
 
-### Claude Code (CLI)
+```
+/mcp add simargl simargl-mcp --store-dir /path/to/my-project/.simargl --project-id myproj
+```
 
-Option A — add to global settings `~/.claude/settings.json`:
+**OpenCode** (`~/.config/opencode/config.json`):
 
 ```json
-{
-  "mcpServers": {
-    "simargl": {
-      "command": "simargl-mcp",
-      "args": ["--store-dir", "C:/repos/sonar/.simargl", "--project-id", "sonar"]
-    }
-  }
-}
+{ "mcp": { "simargl": { "command": ["simargl-mcp"], "cwd": "/path/to/my-project" } } }
 ```
 
-Option B — connect interactively from any session (no restart needed):
-
-```
-/mcp add simargl simargl-mcp --store-dir C:/repos/sonar/.simargl --project-id sonar
-```
-
-Then call tools directly in your prompt:
-```
-use simargl find to locate files related to "add buildString to project analysis"
-```
-
-### OpenCode
-
-Config file: `~/.config/opencode/config.json`
-
-```json
-{
-  "mcp": {
-    "simargl": {
-      "command": ["simargl-mcp"],
-      "cwd": "C:/repos/sonar"
-    }
-  }
-}
-```
-
-### OpenAI Codex CLI
-
-Config file: `~/.codex/config.yaml`
+**OpenAI Codex CLI** (`~/.codex/config.yaml`):
 
 ```yaml
 mcp_servers:
   simargl:
     command: simargl-mcp
-    cwd: C:/repos/sonar
+    cwd: /path/to/my-project
 ```
 
-### Cursor
-
-Config file: `.cursor/mcp.json` in your project root (or global `~/.cursor/mcp.json`):
+**Cursor** (`.cursor/mcp.json` in the project, or `~/.cursor/mcp.json`):
 
 ```json
-{
-  "mcpServers": {
-    "simargl": {
-      "command": "simargl-mcp",
-      "cwd": "${workspaceFolder}"
-    }
-  }
-}
+{ "mcpServers": { "simargl": { "command": "simargl-mcp", "cwd": "${workspaceFolder}" } } }
 ```
 
-`${workspaceFolder}` resolves to the open project directory — simargl will look for `.simargl/` there.
-
-### Windsurf (Codeium)
-
-Config file: `~/.codeium/windsurf/mcp_settings.json`
+**Windsurf** (`~/.codeium/windsurf/mcp_settings.json`):
 
 ```json
-{
-  "mcpServers": {
-    "simargl": {
-      "command": "simargl-mcp",
-      "cwd": "C:/repos/sonar"
-    }
-  }
-}
+{ "mcpServers": { "simargl": { "command": "simargl-mcp", "cwd": "/path/to/my-project" } } }
 ```
 
-### Any other MCP-compatible system
-
-The pattern is always the same:
+**A remote server** (any agent that takes a URL):
 
 ```json
-{
-  "command": "simargl-mcp",
-  "args": [],
-  "cwd": "<directory where .simargl/ lives>"
-}
+{ "mcpServers": { "simargl": { "url": "http://192.168.1.42:8765/sse" } } }
 ```
 
-If the agent system does not support `cwd`, pass it as an env variable instead and adjust the server startup — or simply `cd` to the right directory before launching.
+**Any other MCP client:** the command is `simargl-mcp`, and its working folder (or `--store-dir`)
+is where `.simargl/` lives.
+
+### With 1bcoder
+
+Start [1bcoder](https://pypi.org/project/1bcoder/) in the project folder, so the server finds
+`.simargl/` there:
+
+```
+/mcp connect simargl simargl-mcp
+/mcp connect simargl simargl-mcp --project-id myproj
+/mcp connect simargl simargl-mcp --cwd /path/to/other-project --project-id other
+/mcp tools simargl
+```
+
+A typical session:
+
+```
+/mcp call simargl/find {"query": "make the author field longer in the Book class", "mode": "file"} -> find_result
+/var set find_files matches
+/read {{find_files}}
+make the author field longer in the Book class
+/patch models.py code
+```
 
 ---
 
-### Tip: multiple projects across agents
+## Running on another machine or a phone
 
-If you work on several repos, use `project_id` to keep their indexes separate under the same `.simargl/` directory:
+The index, the embedding model, the MCP server and the web UI can all run on another machine on
+the LAN: a server, a Raspberry Pi, or an Android phone with Termux. The laptop only opens the
+browser or connects an agent.
+
+```bash
+# on the phone (Termux)
+pkg update && pkg install python git ollama
+ollama serve &
+ollama pull nomic-embed-text
+pip install "simargl[http]"
+
+simargl index units /sdcard/data/units.db --project myproj --model ollama://nomic-embed-text
+simargl index files /sdcard/repos/my-project --project myproj --model ollama://nomic-embed-text
+
+nohup simargl-mcp --http --port 8765 > ~/.simargl-mcp.log 2>&1 &
+simargl ui --host 0.0.0.0
+```
 
 ```
-find files related to "add partition rebalance"  project_id=kafka
-find files related to "add buildString to API"   project_id=sonar
+# on the laptop
+/mcp connect simargl http://192.168.1.42:8765/sse        # 1bcoder
+http://192.168.1.42:8099/                                 # the web UI
 ```
+
+| Component | Server / phone | Laptop |
+|---|---|---|
+| Index (`.simargl/`), embedding model, MCP server, web UI | yes | — |
+| Agent / LLM (1bcoder, Claude, …) | — | yes |
+| Source files | for indexing | for editing |
 
 ---
 
 ## PostgreSQL + pgvector backend
 
-For larger codebases or when you want sub-linear search via HNSW index.
+For very large indexes, or for search through an HNSW index instead of a linear scan:
 
 ```bash
-pip install simargl[postgres]
+pip install "simargl[postgres]"
+psql -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+simargl index units units.db --backend postgres --db-url postgresql://user:pass@localhost/simargl
+simargl index files .         --backend postgres --db-url postgresql://user:pass@localhost/simargl
+simargl-mcp                   --backend postgres --db-url postgresql://user:pass@localhost/simargl
 ```
 
-Requires PostgreSQL with pgvector extension:
-```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-```
-
-### Index with postgres backend
-
-```bash
-simargl index units sonar.db --project sonar \
-    --backend postgres \
-    --db-url postgresql://postgres:postgres@localhost/simargl
-
-simargl index files C:/repos/sonar --project sonar \
-    --backend postgres \
-    --db-url postgresql://postgres:postgres@localhost/simargl
-```
-
-### MCP server with postgres
-
-```bash
-simargl-mcp --backend postgres \
-    --db-url postgresql://postgres:postgres@localhost/simargl
-```
-
-### numpy vs postgres — when to choose which
-
-| | numpy | postgres |
+| | numpy (default) | postgres |
 |---|---|---|
-| Install | zero extra deps | psycopg2 + pgvector |
-| Search speed | linear scan | sub-linear (HNSW) |
-| Scales well to | ~500k chunks | millions of chunks |
-| Vacuum | file rebuild | `DELETE` + `VACUUM ANALYZE` |
+| Install | nothing extra | psycopg2 + pgvector |
+| Search | linear scan | HNSW (sub-linear) |
+| Comfortable size | up to ~500k chunks | millions of chunks |
 | Concurrent writes | no | yes |
-| Termux / Android | yes | harder |
-| Laptop / server | yes | yes |
+| Phone / Termux | yes | harder |
 
-For most projects (sonar.db = ~100k chunks) numpy is fast enough. Switch to postgres when search latency becomes noticeable or you index multiple large repos.
+---
+
+## Python API
+
+```python
+from simargl.searcher import search, get_chunk_text
+
+r = search("Login fails after the session expires", mode="task", top_n=10, top_k=10)
+r["files"]      # [{"path", "score", "module"}, ...]
+r["modules"]    # [{"module", "score"}, ...]
+r["units"]      # the similar past tasks: unit_id, text_preview, similarity, files (+ diff with include_diff=True)
+
+r = search("Login fails after the session expires", mode="file", top_n=5)
+for f in r["files"]:
+    print(f["path"], f["score"], get_chunk_text(f["path"], f["chunk_n"]))   # the chunk that matched
+```
+
+`project_id`, `store_dir`, `backend_type` and `db_url` select the index, as on the command line.
+
+---
+
+## Tests
+
+```bash
+git clone https://github.com/szholobetsky/simargl
+cd simargl
+pip install -e .
+pip install pytest
+pytest
+```
+
+## Support
+
+The project is on GitHub: [github.com/szholobetsky/simargl](https://github.com/szholobetsky/simargl).
+Questions, bug reports and suggestions go to its
+[issues](https://github.com/szholobetsky/simargl/issues).
 
 ---
 
 ## Part of the SIMARGL toolkit
 
-simargl is one of eight tools that together form an **intellectual development support system**:
+simargl is one of ten tools that together form an **intellectual development support system**:
 
 | Tool | Role |
 |---|---|
 | **[simargl](https://github.com/szholobetsky/simargl)** | Task-to-code retrieval — given a task description, finds which files and modules are likely affected, using semantic similarity over git history |
-| **[svitovyd](https://github.com/szholobetsky/svitovyd)** | Project map — scans any codebase and produces a structural map of definitions and cross-file dependencies; exposes it as an MCP server |
+| **[svitovyd](https://github.com/szholobetsky/svitovyd)** | Project map — scans any codebase and produces a structural map of definitions and cross-file dependencies; queried from the CLI, a web UI with a layered map, or an MCP server |
 | **[1bcoder](https://github.com/szholobetsky/1bcoder)** | AI coding assistant for small local models — surgical context management, agents, parallel inference, proc scripts |
 | **[yasna](https://github.com/szholobetsky/yasna)** | Session memory — indexes conversations from all AI agents so you can find what was discussed, when, and where |
 | **[radogast](https://github.com/szholobetsky/radogast)** | Context drift monitor — measures how far an AI agent's conversation has drifted from the original task |
-| **[vyrii](https://github.com/szholobetsky/vyrii)** | Local AI web UI — chat, translate, web research, RAG, and file management via Gradio; powered by Ollama or any OpenAI-compatible backend |
-| **[syryn](https://github.com/szholobetsky/syryn)** | Bluetooth identity beacon — returns hostname, mDNS, and active network interfaces for headless devices |
-| **[alkonost](https://github.com/szholobetsky/alkonost)** | Task-board viewer/editor — Trello-style board and backlog over 1bcoder's `deepagent_task` output, with full spec rendering and autosave |
+| **[vyrii](https://github.com/szholobetsky/vyrii)** | Local AI web UI — chat, translate, web research, RAG and file management in the browser (Flask; Gradio optional); powered by Ollama or any OpenAI-compatible backend |
+| **[syryn](https://github.com/szholobetsky/syryn)** | Bluetooth identity beacon for headless devices — the device's IP is its Bluetooth name; hostname, mDNS and network interfaces on request |
+| **[alkonost](https://github.com/szholobetsky/alkonost)** | Browser cockpit for 1bcoder's flows — the `deepagent_*` spec pipeline (plan tree → specs → task board) and the glossary (build, browse, search), tuned for small local models |
+| **[gamayun](https://github.com/szholobetsky/gamayun)** | Statistical ontology without an LLM — builds triples of terms, identifiers, files and modules from task history or a folder of documents and code; every triple carries its significance test |
+| **[mokosh](https://github.com/szholobetsky/mokosh)** | Dataset gathering — commits of a git repository and the tasks of its tracker (Jira, GitHub, GitLab, YouTrack) in one SQLite database that the other tools read |
 
-- **simargl** answers: *what code is related to this task?*
+- **simargl** finds the code related to a task by vector search over the task history (embeddings).
 - **svitovyd** answers: *how is the code structured and what depends on what?*
 - **1bcoder** answers: *how do I work with local models efficiently?*
 - **yasna** answers: *where did I already discuss this?*
 - **radogast** answers: *is the AI agent still on track toward the goal?*
 - **vyrii** answers: *how do I access all of this through a browser?*
 - **syryn** answers: *what is the address of this headless device?*
-- **alkonost** answers: *where do I see and edit the tasks generated from a spec tree?*
+- **alkonost** answers: *how do I turn one task description into a reviewed, working plan — and see the project's glossary — without a big model or a big context window?*
+- **gamayun** finds the code related to a task through an ontology of significant links between words, files and modules (no LLM).
+- **mokosh** prepares the initial dataset from version control and the issue tracker.
 
 Together they cover the full development loop: understand the codebase, find relevant history, work with AI locally, remember what was decided, and verify the context stays on target.
 
@@ -698,9 +450,12 @@ The name comes from Slavic mythology. Simargl (Симаргл) is a winged guard
 
 ---
 
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 ## About
 
 (c) 2026 Stanislav Zholobetskyi, Oleh Andriichuk  
 Institute for Information Recording, National Academy of Sciences of Ukraine, Kyiv  
 PhD research: «Intelligent Technology for Software Development and Maintenance Support»
-

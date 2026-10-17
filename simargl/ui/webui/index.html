@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Simargl</title>
+<link rel="stylesheet" href="/ui/style.css">
+<link rel="stylesheet" id="theme-link" disabled>
+<script>
+  // the theme before the first paint: no flash of the default colours
+  (function () {
+    var t = '';
+    try { t = localStorage.getItem('simargl-theme') || ''; } catch (e) {}
+    var q = new URLSearchParams(location.search).get('theme');
+    if (q !== null) { t = q === 'simargl' ? '' : q; try { localStorage.setItem('simargl-theme', t); } catch (e) {} }
+    if (t) { var l = document.getElementById('theme-link'); l.href = '/ui/themes/' + t + '.css'; l.disabled = false;
+             document.documentElement.setAttribute('data-theme', t); }
+  })();
+</script>
+<script src="/ui/i18n.js"></script>
+<script src="/ui/lang/en.js"></script>
+<script src="/ui/lang/uk.js"></script>
+<script src="/ui/lang/de.js"></script>
+<script src="/ui/lang/fr.js"></script>
+<script src="/ui/lang/es.js"></script>
+<script src="/ui/lang/pt.js"></script>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">🐺</span> Simargl <small data-i18n="tagline">task-to-code search over the task history</small></div>
+  <nav>
+    <button class="tab active" data-tab="search" data-i18n="tab_search">Search</button>
+    <button class="tab" data-tab="tri" data-i18n="tab_tri">Triangulation</button>
+    <button class="tab" data-tab="rrf" data-i18n="tab_rrf">RRF</button>
+    <button class="tab" data-tab="retrieve" data-i18n="tab_retrieve">Retrieve</button>
+    <button class="tab" data-tab="blackhole" data-i18n="tab_blackhole">Blackholes</button>
+    <button class="tab" data-tab="index" data-i18n="tab_index">Index</button>
+    <button class="tab" data-tab="status" data-i18n="tab_status">Status</button>
+  </nav>
+  <select id="store" data-i18n-title="store_title"></select>
+  <select id="project" data-i18n-title="project_title"></select>
+  <select id="theme" data-i18n-title="theme_title"></select>
+  <select id="lang" data-i18n-title="lang_title"></select>
+  <button id="refresh" class="small" data-i18n-title="refresh_title">⟳</button>
+</header>
+<div id="scope" class="scope dim"></div>
+
+<main>
+  <!-- SEARCH -->
+  <section id="tab-search" class="panel active">
+    <textarea id="s-query" rows="4" data-i18n-ph="query_ph"></textarea>
+    <div class="params">
+      <label><span data-i18n="mode">mode</span><select id="s-mode">
+        <option value="task" data-i18n="mode_task">task — similar past tasks</option>
+        <option value="file" data-i18n="mode_file">file — code chunks</option>
+        <option value="aggr" data-i18n="mode_aggr">aggr — tasks + code</option>
+        <option value="refine" data-i18n="mode_refine">refine — tasks, then code</option></select></label>
+      <label><span data-i18n="sort">sort</span><select id="s-sort">
+        <option value="rank" data-i18n="sort_rank">rank — best similarity</option>
+        <option value="freq" data-i18n="sort_freq">freq — how many similar tasks</option></select></label>
+      <label data-i18n-title="top_n_title"><span data-i18n="top_n">files</span><input id="s-top-n" type="number" min="1" max="200" value="10"></label>
+      <label data-i18n-title="top_k_title"><span data-i18n="top_k">similar tasks</span><input id="s-top-k" type="number" min="1" max="200" value="10"></label>
+      <label data-i18n-title="top_m_title"><span data-i18n="top_m">modules</span><input id="s-top-m" type="number" min="1" max="100" value="5"></label>
+      <label data-i18n-title="blend_title"><span data-i18n="score_blend">score blend</span><input id="s-blend" type="number" min="0" max="1" step="0.05" value="1"></label>
+      <label data-i18n-title="penalty_title"><span data-i18n="coverage_penalty">coverage penalty</span><input id="s-penalty" type="number" min="0" max="1" step="0.05" value="0"></label>
+      <label class="refine-only" hidden><span data-i18n="refine_k">refine: tasks</span><input id="s-rk" type="number" min="1" max="200" value="10"></label>
+      <label class="refine-only" hidden><span data-i18n="refine_m">refine: modules</span><input id="s-rm" type="number" min="1" max="100" value="8"></label>
+      <label class="check"><input type="checkbox" id="s-diff"> <span data-i18n="include_diff">with diffs</span></label>
+      <label class="check"><input type="checkbox" id="s-bh"> <span data-i18n="exclude_bh">skip blackholes</span></label>
+    </div>
+    <div class="row">
+      <button id="s-go" class="primary" data-i18n="search_btn">Search</button>
+      <span id="s-status" class="dim"></span>
+    </div>
+    <div id="s-out"></div>
+    <details class="guide">
+      <summary data-i18n="search_guide_t">How the search works</summary>
+      <p data-i18n-html="search_guide_1"></p>
+      <p data-i18n-html="search_guide_2"></p>
+    </details>
+  </section>
+
+  <!-- TRIANGULATION -->
+  <section id="tab-tri" class="panel">
+    <textarea id="x-query" rows="4" data-i18n-ph="query_ph"></textarea>
+    <div class="params">
+      <label class="toolsel" style="grid-column: span 2"><span><span class="tdot simargl"></span> simargl</span><input id="x-sim" disabled></label>
+      <label class="toolsel" style="grid-column: span 2"><span><span class="tdot gamayun"></span> gamayun</span><select id="x-gam"></select></label>
+      <label class="toolsel" style="grid-column: span 2"><span><span class="tdot svitovyd"></span> svitovyd</span><select id="x-svi"></select></label>
+      <label><span data-i18n="sort">sort</span><select id="x-sort"><option value="freq" data-i18n="sort_freq">freq</option><option value="rank" data-i18n="sort_rank">rank</option></select></label>
+      <label><span data-i18n="x_depth">files per tool</span><input id="x-k" type="number" min="5" max="200" value="50"></label>
+    </div>
+    <div class="row"><button id="x-go" class="primary" data-i18n="x_btn">Triangulate</button><span id="x-status" class="dim"></span></div>
+    <div id="x-out"></div>
+    <details class="guide">
+      <summary data-i18n="x_guide_t">How triangulation works</summary>
+      <p data-i18n-html="x_guide_1"></p>
+      <p data-i18n-html="x_guide_2"></p>
+    </details>
+  </section>
+
+  <!-- RRF -->
+  <section id="tab-rrf" class="panel">
+    <textarea id="r-query" rows="3" data-i18n-ph="query_ph"></textarea>
+    <h3 data-i18n="rrf_sources">Sources (mode : index)</h3>
+    <div id="r-sources" class="srcs"></div>
+    <div class="params">
+      <label><span data-i18n="top_n">files</span><input id="r-top-n" type="number" min="1" max="200" value="10"></label>
+      <label><span data-i18n="top_k">similar tasks</span><input id="r-top-k" type="number" min="1" max="200" value="10"></label>
+      <label data-i18n-title="rrf_k_title"><span>k</span><input id="r-k" type="number" min="1" max="1000" value="60"></label>
+      <label><span data-i18n="sort">sort</span><select id="r-sort"><option value="freq" data-i18n="sort_freq">freq</option><option value="rank" data-i18n="sort_rank">rank</option></select></label>
+      <label><span data-i18n="score_blend">score blend</span><input id="r-blend" type="number" min="0" max="1" step="0.05" value="1"></label>
+      <label><span data-i18n="coverage_penalty">coverage penalty</span><input id="r-penalty" type="number" min="0" max="1" step="0.05" value="0"></label>
+    </div>
+    <div class="row"><button id="r-go" class="primary" data-i18n="search_btn">Search</button><span id="r-status" class="dim"></span></div>
+    <div id="r-out"></div>
+    <p class="help" data-i18n-html="rrf_help"></p>
+  </section>
+
+  <!-- RETRIEVE -->
+  <section id="tab-retrieve" class="panel">
+    <textarea id="t-query" rows="3" data-i18n-ph="query_ph"></textarea>
+    <div class="params">
+      <label><span data-i18n="mode">mode</span><select id="t-mode"><option value="file" data-i18n="mode_file">file</option><option value="task" data-i18n="mode_task">task</option></select></label>
+      <label><span data-i18n="top_n_chunks">chunks</span><input id="t-top-n" type="number" min="1" max="50" value="5"></label>
+      <label><span data-i18n="score_blend">score blend</span><input id="t-blend" type="number" min="0" max="1" step="0.05" value="1"></label>
+      <label><span data-i18n="coverage_penalty">coverage penalty</span><input id="t-penalty" type="number" min="0" max="1" step="0.05" value="0"></label>
+      <label style="grid-column: span 2"><span data-i18n="source_dir">source folder (optional)</span><input id="t-src" data-i18n-ph="source_dir_ph"></label>
+      <label class="check"><input type="checkbox" id="t-bh"> <span data-i18n="exclude_bh">skip blackholes</span></label>
+    </div>
+    <div class="row"><button id="t-go" class="primary" data-i18n="retrieve_btn">Retrieve</button>
+      <button id="t-copy" class="small" data-i18n="copy">Copy</button><span id="t-status" class="dim"></span></div>
+    <pre id="t-out" class="out" hidden></pre>
+    <p class="help" data-i18n-html="retrieve_help"></p>
+  </section>
+
+  <!-- BLACKHOLES -->
+  <section id="tab-blackhole" class="panel">
+    <div class="params">
+      <label><span data-i18n="bh_method">method</span><select id="b-method">
+        <option value="centroid" data-i18n="bh_centroid">centroid — close to the centre of everything</option>
+        <option value="coverage" data-i18n="bh_coverage">coverage — answers too many random queries</option>
+        <option value="coverage_float" data-i18n="bh_float">coverage scores — re-rank, mark nothing</option></select></label>
+      <label><span data-i18n="bh_threshold">threshold</span><input id="b-thr" type="number" min="0" max="1" step="0.01" value="0.85"></label>
+      <label><span data-i18n="bh_queries">test queries</span><input id="b-n" type="number" min="10" max="5000" value="200"></label>
+      <label><span>top-k</span><input id="b-k" type="number" min="1" max="200" value="10"></label>
+    </div>
+    <div class="row"><button id="b-go" class="primary" data-i18n="bh_detect">Detect</button>
+      <button id="b-list" class="small" data-i18n="bh_list">List marked</button><span id="b-status" class="dim"></span></div>
+    <div id="b-out"></div>
+    <p class="help" data-i18n-html="bh_help"></p>
+  </section>
+
+  <!-- INDEX (admin) -->
+  <section id="tab-index" class="panel">
+    <h2 data-i18n="models_t">Embedding models</h2>
+    <div id="m-info" class="card modelinfo"></div>
+    <div class="row">
+      <input id="m-pull" style="flex:1;min-width:0" value="ollama://granite-embedding:30m" data-i18n-title="pull_title">
+      <button id="m-pull-go" class="small" data-i18n="pull_btn">Pull into Ollama</button>
+      <input id="m-host" style="width:220px" data-i18n-ph="host_ph">
+      <button id="m-refresh" class="small" data-i18n="refresh_models">Look again</button>
+    </div>
+    <datalist id="model-list"></datalist>
+
+    <h2 data-i18n="units_t">Index the task history</h2>
+    <div class="params">
+      <label><span data-i18n="index_name">index name</span><input id="u-project" value="default"></label>
+      <label style="grid-column: span 2"><span data-i18n="db_path">task database (optional)</span><input id="u-db" data-i18n-ph="db_ph"></label>
+      <label style="grid-column: span 2"><span data-i18n="model">model</span><input id="u-model" list="model-list" data-i18n-ph="model_ph"></label>
+      <label><span data-i18n="units_mode">units</span><select id="u-mode"><option value="auto">auto</option><option value="tasks">tasks</option><option value="commits">commits</option></select></label>
+    </div>
+    <div class="row"><button id="u-go" class="primary" data-i18n="index_btn">Index</button></div>
+
+    <h2 data-i18n="files_t">Index the code</h2>
+    <div class="params">
+      <label><span data-i18n="index_name">index name</span><input id="f-project" value="code"></label>
+      <label style="grid-column: span 2"><span data-i18n="source_folder">source folder</span><input id="f-src"></label>
+      <label style="grid-column: span 2"><span data-i18n="model">model</span><input id="f-model" list="model-list" data-i18n-ph="model_ph"></label>
+      <label><span data-i18n="chunk_size">chunk size</span><input id="f-chunk" type="number" min="50" max="4000" value="400"></label>
+      <label class="check"><input type="checkbox" id="f-full"> <span data-i18n="full_rebuild">rebuild all</span></label>
+    </div>
+    <div class="row"><button id="f-go" class="primary" data-i18n="index_btn">Index</button></div>
+
+    <div class="row">
+      <button id="v-go" class="small" data-i18n="vacuum_btn">Vacuum the chosen index</button>
+    </div>
+    <pre id="job-log" class="log" hidden></pre>
+    <p class="help" data-i18n-html="index_help"></p>
+  </section>
+
+  <!-- STATUS -->
+  <section id="tab-status" class="panel">
+    <div class="row"><button id="st-go" class="primary" data-i18n="show">Show</button><span id="st-status" class="dim"></span></div>
+    <div id="st-out"></div>
+  </section>
+
+</main>
+<script>applyLang();</script>
+<script src="/ui/app.js"></script>
+</body>
+</html>

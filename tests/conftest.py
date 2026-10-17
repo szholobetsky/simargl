@@ -7,6 +7,7 @@ import pytest
 class MockEmbedder:
     """Deterministic fake embedder — no model download required."""
     dim = 8
+    index_flush_size = 256      # the indexer flushes this many texts at a time (BaseEmbedder's default)
 
     def encode(self, texts: list[str], batch_size: int = 32) -> np.ndarray:
         rng = np.random.RandomState(sum(len(t) for t in texts) % 1000)
@@ -23,20 +24,27 @@ def mock_embedder(monkeypatch):
     return emb
 
 
-@pytest.fixture
-def tiny_db(tmp_path):
-    """SQLite with COMMIT table and a few rows."""
+# table layouts seen in the wild: canonical singular, older simargl ingest
+# (plural), and the codeXtract datasets sonar.db / flink.db (TASK + COMMITS)
+_LAYOUTS = {"singular": ("TASK", '"COMMIT"'), "plural": ("TASKS", "COMMITS"),
+            "mixed": ("TASK", "COMMITS")}
+
+
+@pytest.fixture(params=list(_LAYOUTS))
+def tiny_db(tmp_path, request):
+    """SQLite with task + commit tables and a few rows, in every table layout."""
+    task_t, commit_t = _LAYOUTS[request.param]
     db = tmp_path / "units.db"
     con = sqlite3.connect(db)
-    con.execute("""
-        CREATE TABLE COMMITS (
+    con.execute(f"""
+        CREATE TABLE {commit_t} (
             ID INTEGER PRIMARY KEY,
             SHA TEXT, AUTHOR_NAME TEXT, AUTHOR_EMAIL TEXT,
             CMT_DATE TEXT, MESSAGE TEXT, PATH TEXT, DIFF TEXT, TASK_NAME TEXT
         )
     """)
-    con.execute("""
-        CREATE TABLE TASKS (
+    con.execute(f"""
+        CREATE TABLE {task_t} (
             ID INTEGER PRIMARY KEY,
             NAME TEXT, TITLE TEXT, DESCRIPTION TEXT, COMMENTS TEXT
         )
@@ -50,13 +58,13 @@ def tiny_db(tmp_path):
          "PROJ-1 update login validation", "auth/login.py", "+ raise ValueError", "PROJ-1"),
     ]
     con.executemany(
-        "INSERT INTO COMMITS VALUES (?,?,?,?,?,?,?,?,?)", rows
+        f"INSERT INTO {commit_t} VALUES (?,?,?,?,?,?,?,?,?)", rows
     )
     task_rows = [
         (1, "PROJ-1", "Fix login", "Users cannot login with special chars", ""),
         (2, "PROJ-2", "User endpoint", "Add REST endpoint for user retrieval", ""),
     ]
-    con.executemany("INSERT INTO TASKS VALUES (?,?,?,?,?)", task_rows)
+    con.executemany(f"INSERT INTO {task_t} VALUES (?,?,?,?,?)", task_rows)
     con.commit()
     con.close()
     return db

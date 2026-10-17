@@ -4,16 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "simargl"
-version = "0.1.10"
+version = "0.1.11"
 description = "Task-to-code retrieval — MCP server and web UI"
 requires-python = ">=3.10"
 readme = {file = "README.md", content-type = "text/markdown"}
 dependencies = [
-    "sentence-transformers>=2.2",
-    "mcp>=1.0",
     "numpy>=1.24",
     "tqdm>=4.60",
     "pyyaml>=6.0",
+    "mokosh>=0.1",       # gathers the task/commit database that simargl indexes
+    "flask>=2.3",        # the web UI (simargl ui) — pure Python, installs anywhere, phones included
+    "waitress>=2.1",
+    "gamayun-ontology>=0.1",      # triangulation: the statistical answer (ontology of the task history)
+    "svitovyd>=0.1.8",   # triangulation: the structural answer (map of the code)
 ]
 
 [project.urls]
@@ -21,11 +24,15 @@ Homepage = "https://github.com/szholobetsky/simargl"
 Repository = "https://github.com/szholobetsky/simargl"
 
 [project.optional-dependencies]
-ui      = ["gradio>=4.0"]
+torch   = ["sentence-transformers>=2.2"]   # local models (bge-small, bge-large, jina-code) — fast batch indexing
+mcp     = ["mcp>=1.0"]                     # simargl serve / simargl-mcp
+gradio  = ["gradio>=4.0"]                  # the older Gradio UI: simargl ui --gradio
+ui      = []                               # kept so `pip install simargl[ui]` still works: the web UI is built in now
+all     = ["sentence-transformers>=2.2", "mcp>=1.0", "uvicorn>=0.24"]
 postgres = ["psycopg2-binary>=2.9", "pgvector>=0.2"]
-http    = ["uvicorn>=0.24"]
-ingest  = ["gitpython>=3.1", "requests>=2.28", "beautifulsoup4>=4.12"]
-selenium = ["selenium>=4.0"]
+http    = ["mcp>=1.0", "uvicorn>=0.24"]
+ingest  = []                      # kept so `pip install simargl[ingest]` still works: mokosh is a dependency now
+selenium = ["mokosh[selenium]"]
 
 [project.scripts]
 simargl     = "simargl.ui.cli:main"
@@ -34,3 +41,6 @@ simargl-mcp = "simargl.mcp_server:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["simargl*"]
+
+[tool.setuptools.package-data]
+"simargl" = ["ui/webui/**/*"]

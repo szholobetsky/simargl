@@ -14,7 +14,18 @@ MODELS = {
                   "trust_remote_code": True, "batch_size": 1, "max_seq_length": 512},
 }
 
-DEFAULT_MODEL = "bge-small"
+# Default for NEW indexes: granite-embedding:30m served by Ollama (63 MB, 384 dims). In simrgl exp12
+# (CPU, sonar tasks) it gave the best MAP of the models measured (0.200; bge-small 0.171) at 6.5
+# texts/s against 3.0 for bge-large, which exp12 has not scored yet. No torch needed (the embedding
+# runs wherever Ollama runs); local torch models stay one `pip install simargl[torch]` away.
+DEFAULT_MODEL = "ollama://granite-embedding:30m"
+
+# An index records the model it was built with (meta.json "model_key"); an index built before
+# that was recorded was built with bge-small — never search it with today's default instead.
+LEGACY_MODEL = "bge-small"
+
+# Ollama embeds a list of texts per request (/api/embed); this many texts per request
+OLLAMA_BATCH = 16
 DEFAULT_TOP_K = 10
 DEFAULT_TOP_N = 10
 DEFAULT_TOP_M = 5
